@@ -1,0 +1,132 @@
+@import "@fontsource/orbitron/500.css";
+@import "@fontsource/orbitron/700.css";
+@import "@fontsource/orbitron/800.css";
+@import "@fontsource/rajdhani/500.css";
+@import "@fontsource/rajdhani/600.css";
+@import "@fontsource/rajdhani/700.css";
+@import "tailwindcss";
+
+@theme {
+  --font-display: "Orbitron", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "Rajdhani", ui-sans-serif, system-ui, sans-serif;
+}
+
+:root {
+  color-scheme: dark;
+  --bg-void: #060412;
+  --bg-panel: rgba(9, 8, 26, 0.92);
+  --bg-panel-solid: #0a091f;
+  --neon-cyan: #00f0ff;
+  --neon-magenta: #ff2a9d;
+  --neon-orange: #ff7a18;
+  --neon-violet: #9d4edd;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  background-color: var(--bg-void);
+  font-family: var(--font-sans);
+  overflow: hidden;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.font-display {
+  font-family: var(--font-display);
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Neon HUD panel frame matching AppLayout + synthwave glow reference */
+.neon-frame-cyan {
+  background: linear-gradient(180deg, rgba(11, 10, 32, 0.96) 0%, rgba(7, 6, 22, 0.96) 100%);
+  border: 2px solid rgba(0, 240, 255, 0.78);
+  box-shadow:
+    0 0 14px rgba(0, 240, 255, 0.24),
+    inset 0 0 18px rgba(0, 240, 255, 0.08);
+}
+
+.neon-frame-magenta {
+  background: linear-gradient(180deg, rgba(13, 9, 30, 0.95) 0%, rgba(8, 6, 22, 0.95) 100%);
+  border: 2px solid rgba(255, 42, 157, 0.72);
+  box-shadow:
+    0 0 14px rgba(255, 42, 157, 0.2),
+    inset 0 0 16px rgba(255, 42, 157, 0.07);
+}
+
+.neon-frame-hud {
+  background: linear-gradient(180deg, rgba(10, 9, 28, 0.96) 0%, rgba(6, 5, 19, 0.97) 100%);
+  border: 2px solid rgba(0, 240, 255, 0.85);
+  box-shadow:
+    0 0 18px rgba(0, 240, 255, 0.28),
+    0 0 32px rgba(255, 42, 157, 0.12),
+    inset 0 0 22px rgba(0, 240, 255, 0.09);
+}
+
+.neon-progress-outline {
+  border: 2px solid #ff8c1a;
+  box-shadow:
+    0 0 10px rgba(255, 140, 26, 0.45),
+    inset 0 0 8px rgba(255, 140, 26, 0.2);
+}
+
+.text-glow-cyan {
+  text-shadow: 0 0 14px rgba(0, 240, 255, 0.6);
+}
+
+.text-glow-magenta {
+  text-shadow: 0 0 14px rgba(255, 42, 157, 0.6);
+}
+
+.text-glow-amber {
+  text-shadow: 0 0 14px rgba(255, 165, 24, 0.6);
+}
+
+/* Custom sleek synthwave scrollbars for nested step list & modals */
+.synth-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(0, 240, 255, 0.45) rgba(10, 9, 28, 0.6);
+}
+
+.synth-scroll::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.synth-scroll::-webkit-scrollbar-track {
+  background: rgba(10, 9, 28, 0.6);
+}
+
+.synth-scroll::-webkit-scrollbar-thumb {
+  background: rgba(0, 240, 255, 0.45);
+  border-radius: 3px;
+}
+
+.synth-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 240, 255, 0.75);
+}
+
+/* Container queries for fluid HUD scaling */
+.hud-container {
+  container-type: inline-size;
+}
+
+.ride-grid {
+  container-type: size;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

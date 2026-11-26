@@ -1,0 +1,74 @@
+<workout_file>
+	<author>Paul Breen (via TrainingPeaks)</author>
+	<name>Progressions</name>
+	<description>Warm up
+2mins @120w
+2mins @ 150
+2mins @ 185
+x2
+
+Main
+Set 1:
+2mins @ 200w
+2mins @ 230W
+2mins @ 255W
+2mins @ 275W
+
+5mins L1 recovery
+
+Set 2:
+2mins @ 210w
+2mins @ 240W
+2mins @ 265W
+2mins @ 285w
+2mins @ 285w
+
+5mins L1 recovery
+
+10mins SS 245-259w
+
+Cool down
+10mins L1</description>
+	<sportType>bike</sportType>
+	<tags/>
+	<workout>
+		<Warmup Duration="120" PowerHigh="0.54" PowerLow="0.34">
+		</Warmup>
+		<SteadyState Duration="120" Power="0.54">
+		</SteadyState>
+		<SteadyState Duration="120" Power="0.66">
+		</SteadyState>
+		<SteadyState Duration="120" Power="0.44">
+		</SteadyState>
+		<SteadyState Duration="120" Power="0.54">
+		</SteadyState>
+		<SteadyState Duration="120" Power="0.66">
+		</SteadyState>
+		<SteadyState Duration="120" Power="0.72">
+		</SteadyState>
+		<SteadyState Duration="120" Power="0.82">
+		</SteadyState>
+		<SteadyState Duration="120" Power="0.92">
+		</SteadyState>
+		<SteadyState Duration="120" Power="0.99">
+		</SteadyState>
+		<SteadyState Duration="300" Power="0.55">
+		</SteadyState>
+		<SteadyState Duration="120" Power="0.75">
+		</SteadyState>
+		<SteadyState Duration="120" Power="0.85">
+		</SteadyState>
+		<SteadyState Duration="120" Power="0.95">
+		</SteadyState>
+		<SteadyState Duration="120" Power="1.05">
+		</SteadyState>
+		<SteadyState Duration="120" Power="1.15">
+		</SteadyState>
+		<SteadyState Duration="300" Power="0.55">
+		</SteadyState>
+		<SteadyState Duration="600" Power="0.9">
+		</SteadyState>
+		<Cooldown Duration="600" PowerHigh="0.4" PowerLow="0.6">
+		</Cooldown>
+	</workout>
+</workout_file>

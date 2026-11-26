@@ -1,0 +1,53 @@
+<workout_file>
+	<author>Paul Breen (via TrainingPeaks)</author>
+	<name>SS with efforts</name>
+	<description></description>
+	<sportType>bike</sportType>
+	<tags/>
+	<workout>
+		<Warmup Duration="180" PowerHigh="0.6" PowerLow="0.4">
+		</Warmup>
+		<SteadyState Duration="60" Power="0.6">
+		</SteadyState>
+		<SteadyState Duration="60" Power="0.67">
+		</SteadyState>
+		<SteadyState Duration="60" Power="0.73">
+		</SteadyState>
+		<SteadyState Duration="60" Power="0.8">
+		</SteadyState>
+		<IntervalsT Repeat="3" OnDuration="30" OnPower="1" OffDuration="60" OffPower="0.55">
+		</IntervalsT>
+		<SteadyState Duration="150" Power="0.7">
+		</SteadyState>
+		<SteadyState Duration="60" Power="1.1">
+		</SteadyState>
+		<SteadyState Duration="480" Power="0.9">
+		</SteadyState>
+		<SteadyState Duration="60" Power="1.1">
+		</SteadyState>
+		<SteadyState Duration="240" Power="0.45">
+		</SteadyState>
+		<SteadyState Duration="60" Power="1.1">
+		</SteadyState>
+		<SteadyState Duration="480" Power="0.9">
+		</SteadyState>
+		<SteadyState Duration="60" Power="1.1">
+		</SteadyState>
+		<SteadyState Duration="240" Power="0.45">
+		</SteadyState>
+		<SteadyState Duration="60" Power="1.1">
+		</SteadyState>
+		<SteadyState Duration="480" Power="0.9">
+		</SteadyState>
+		<SteadyState Duration="60" Power="1.1">
+		</SteadyState>
+		<SteadyState Duration="120" Power="0.5">
+		</SteadyState>
+		<SteadyState Duration="120" Power="0.47">
+		</SteadyState>
+		<SteadyState Duration="120" Power="0.44">
+		</SteadyState>
+		<SteadyState Duration="120" Power="0.4">
+		</SteadyState>
+	</workout>
+</workout_file>

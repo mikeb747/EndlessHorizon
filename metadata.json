@@ -1,0 +1,6 @@
+{
+  "name": "NeonVelo",
+  "description": "Synthwave indoor cycling training application with 3D procedural neon worlds, ERG workout engine, and live telemetry HUD.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
