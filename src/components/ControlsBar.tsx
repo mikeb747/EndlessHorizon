@@ -13,6 +13,8 @@ import {
   SkipBack,
   SkipForward,
   Square,
+  Volume2,
+  VolumeX,
 } from 'lucide-react';
 import { clampFreeRideCenterWatts, FREE_RIDE_WATT_STEP } from '../core/freeRide';
 import { COGGAN_ZONES } from '../core/zones';
@@ -28,6 +30,10 @@ export function ControlsBar() {
   const effectiveFtp = useAppStore(getEffectiveFtpFromState);
   const showGraph = useAppStore((s) => s.showGraph);
   const trainerStatus = useAppStore((s) => s.trainerStatus);
+  const audioEnabled = useAppStore((s) => s.audioEnabled);
+  const audioMuted = useAppStore((s) => s.audioMuted);
+  const audioMasterVolume = useAppStore((s) => s.audioMasterVolume);
+  const audioRideVolume = useAppStore((s) => s.audioRideVolume);
 
   const togglePlayPause = useAppStore((s) => s.togglePlayPause);
   const previousStep = useAppStore((s) => s.previousStep);
@@ -38,8 +44,12 @@ export function ControlsBar() {
   const adjustFreeRideWatts = useAppStore((s) => s.adjustFreeRideWatts);
   const resetFreeRideOffset = useAppStore((s) => s.resetFreeRideOffset);
   const toggleGraph = useAppStore((s) => s.toggleGraph);
+  const toggleAudioMute = useAppStore((s) => s.toggleAudioMute);
   const setActiveModal = useAppStore((s) => s.setActiveModal);
   const setScreen = useAppStore((s) => s.setScreen);
+
+  const isAudioAudible =
+    audioEnabled && !audioMuted && audioMasterVolume > 0 && audioRideVolume > 0;
 
   const isFreeRide = rideMode === 'freeride';
   const freeRideRange = clampFreeRideCenterWatts(freeRideZone, ftp, freeRideOffsetWatts);
@@ -260,6 +270,21 @@ export function ControlsBar() {
         >
           <BookOpen className="w-4 h-4" />
           <span className="hidden lg:inline">Library</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={toggleAudioMute}
+          className={`min-h-[48px] min-w-[48px] px-2.5 rounded-md border flex items-center justify-center transition-colors shrink-0 ${
+            isAudioAudible
+              ? 'bg-cyan-500/20 border-cyan-400/70 text-cyan-100 hover:bg-cyan-500/30'
+              : 'bg-[#110e2d] border-slate-700 text-slate-400 hover:border-cyan-500/50 hover:text-slate-200'
+          }`}
+          aria-label={isAudioAudible ? 'Mute ambient audio' : 'Unmute ambient audio'}
+          title="Toggle Ambient Audio (M)"
+          data-testid="btn-toggle-audio"
+        >
+          {isAudioAudible ? <Volume2 className="w-4 h-4" /> : <VolumeX className="w-4 h-4" />}
         </button>
 
         <button

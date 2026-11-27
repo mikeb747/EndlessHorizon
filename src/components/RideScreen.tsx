@@ -89,6 +89,11 @@ export function RideScreen() {
           e.preventDefault();
           state.setActiveModal('settings');
           break;
+        case 'm':
+        case 'M':
+          e.preventDefault();
+          state.toggleAudioMute();
+          break;
         case 'f':
         case 'F':
           e.preventDefault();

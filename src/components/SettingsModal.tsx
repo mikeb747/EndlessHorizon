@@ -1,4 +1,4 @@
-import { Gauge, Keyboard, Layers, Monitor, Sliders, X } from 'lucide-react';
+import { Gauge, Keyboard, Layers, Monitor, Sliders, Volume2, VolumeX, X } from 'lucide-react';
 import { QualityLevel, SceneryTheme, useAppStore } from '../store/useAppStore';
 import { FtpInput } from './FtpInput';
 
@@ -49,6 +49,21 @@ export function SettingsModal() {
   const setAutoPauseEnabled = useAppStore((s) => s.setAutoPauseEnabled);
   const cadenceMatchingEnabled = useAppStore((s) => s.cadenceMatchingEnabled);
   const setCadenceMatchingEnabled = useAppStore((s) => s.setCadenceMatchingEnabled);
+  const audioEnabled = useAppStore((s) => s.audioEnabled);
+  const setAudioEnabled = useAppStore((s) => s.setAudioEnabled);
+  const audioMuted = useAppStore((s) => s.audioMuted);
+  const toggleAudioMute = useAppStore((s) => s.toggleAudioMute);
+  const audioMasterVolume = useAppStore((s) => s.audioMasterVolume);
+  const setAudioMasterVolume = useAppStore((s) => s.setAudioMasterVolume);
+  const audioMenuVolume = useAppStore((s) => s.audioMenuVolume);
+  const setAudioMenuVolume = useAppStore((s) => s.setAudioMenuVolume);
+  const audioRideVolume = useAppStore((s) => s.audioRideVolume);
+  const setAudioRideVolume = useAppStore((s) => s.setAudioRideVolume);
+
+  const isAudioAudible = audioEnabled && !audioMuted && audioMasterVolume > 0;
+  const masterPct = Math.round(audioMasterVolume * 100);
+  const menuPct = Math.round(audioMenuVolume * 100);
+  const ridePct = Math.round(audioRideVolume * 100);
 
   return (
     <div
@@ -110,6 +125,126 @@ export function SettingsModal() {
               <span className="text-sm text-slate-300 ml-1">
                 Watts (persisted locally · updates all step targets immediately)
               </span>
+            </div>
+          </section>
+
+          {/* Synthwave Ambient Audio */}
+          <section className="space-y-3" data-testid="settings-audio-section">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h3 className="font-display text-xs font-bold tracking-[0.16em] text-cyan-300 uppercase flex items-center gap-2">
+                {isAudioAudible ? <Volume2 className="w-4 h-4 text-cyan-300" /> : <VolumeX className="w-4 h-4 text-slate-400" />}
+                Synthwave Ambient Audio
+              </h3>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={toggleAudioMute}
+                  className={`min-h-[40px] px-3 rounded-md font-display text-xs font-bold border flex items-center gap-1.5 transition-colors ${
+                    audioMuted || !audioEnabled
+                      ? 'bg-[#070516] border-slate-600 text-slate-300 hover:border-cyan-400/50'
+                      : 'bg-pink-500/20 border-pink-400/75 text-pink-100 hover:bg-pink-500/30'
+                  }`}
+                  data-testid="settings-audio-mute"
+                >
+                  {audioMuted || !audioEnabled ? <VolumeX className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
+                  {audioMuted ? 'Unmute' : 'Mute'}
+                </button>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={audioEnabled}
+                  onClick={() => setAudioEnabled(!audioEnabled)}
+                  className={`min-h-[40px] min-w-[74px] px-3 rounded-md font-display text-xs font-bold border transition-colors ${
+                    audioEnabled
+                      ? 'bg-cyan-500/25 border-cyan-400 text-cyan-100'
+                      : 'bg-[#070516] border-slate-600 text-slate-400'
+                  }`}
+                  data-testid="toggle-audio-enabled"
+                >
+                  {audioEnabled ? 'ON' : 'OFF'}
+                </button>
+              </div>
+            </div>
+
+            <div className={`rounded-lg bg-[#0a0820] border border-cyan-500/30 p-4 space-y-3.5 transition-opacity ${audioEnabled ? 'opacity-100' : 'opacity-55'}`}>
+              {/* Master Volume */}
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between text-xs">
+                  <label htmlFor="slider-master-volume" className="font-semibold text-white">
+                    Master Volume
+                  </label>
+                  <span className="font-display font-bold tabular-nums text-cyan-300" data-testid="readout-master-volume">
+                    {masterPct}%
+                  </span>
+                </div>
+                <input
+                  id="slider-master-volume"
+                  type="range"
+                  min={0}
+                  max={100}
+                  step={1}
+                  value={masterPct}
+                  disabled={!audioEnabled}
+                  onChange={(e) => setAudioMasterVolume(Number(e.target.value) / 100)}
+                  aria-label="Master volume"
+                  data-testid="slider-master-volume"
+                  className="w-full h-2.5 rounded-lg bg-[#161238] accent-cyan-400 cursor-pointer disabled:cursor-not-allowed"
+                />
+              </div>
+
+              {/* Main Menu Volume */}
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between text-xs">
+                  <label htmlFor="slider-menu-volume" className="font-semibold text-slate-200">
+                    Main Menu Volume
+                  </label>
+                  <span className="font-display font-bold tabular-nums text-pink-300" data-testid="readout-menu-volume">
+                    {menuPct}%
+                  </span>
+                </div>
+                <input
+                  id="slider-menu-volume"
+                  type="range"
+                  min={0}
+                  max={100}
+                  step={1}
+                  value={menuPct}
+                  disabled={!audioEnabled}
+                  onChange={(e) => setAudioMenuVolume(Number(e.target.value) / 100)}
+                  aria-label="Main menu volume"
+                  data-testid="slider-menu-volume"
+                  className="w-full h-2.5 rounded-lg bg-[#161238] accent-pink-400 cursor-pointer disabled:cursor-not-allowed"
+                />
+              </div>
+
+              {/* Ride Volume */}
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between text-xs">
+                  <label htmlFor="slider-ride-volume" className="font-semibold text-slate-200">
+                    Ride Volume
+                  </label>
+                  <span className="font-display font-bold tabular-nums text-cyan-300" data-testid="readout-ride-volume">
+                    {ridePct}%
+                  </span>
+                </div>
+                <input
+                  id="slider-ride-volume"
+                  type="range"
+                  min={0}
+                  max={100}
+                  step={1}
+                  value={ridePct}
+                  disabled={!audioEnabled}
+                  onChange={(e) => setAudioRideVolume(Number(e.target.value) / 100)}
+                  aria-label="Ride volume"
+                  data-testid="slider-ride-volume"
+                  className="w-full h-2.5 rounded-lg bg-[#161238] accent-cyan-400 cursor-pointer disabled:cursor-not-allowed"
+                />
+              </div>
+
+              <p className="text-[11px] text-slate-400 leading-snug">
+                Procedural Web Audio synthwave soundtrack: ambient horizon pads on the Main Menu, shifting into zone-reactive bass and arpeggio pulse during rides.
+              </p>
             </div>
           </section>
 
@@ -297,6 +432,7 @@ export function SettingsModal() {
               <div><strong className="text-cyan-300">→ / ←</strong> · Skip / Prev Step</div>
               <div><strong className="text-cyan-300">G</strong> · Toggle Graph</div>
               <div><strong className="text-cyan-300">H</strong> · Toggle Holo Cards</div>
+              <div><strong className="text-cyan-300">M</strong> · Mute / Unmute Audio</div>
               <div><strong className="text-cyan-300">F</strong> · Fullscreen</div>
             </div>
           </section>

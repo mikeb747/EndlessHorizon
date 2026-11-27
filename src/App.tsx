@@ -1,4 +1,5 @@
 import { useEffect } from 'react';
+import { SynthwaveAudioBridge } from './audio/SynthwaveAudioBridge';
 import { DevicesModal } from './components/DevicesModal';
 import { MainMenu } from './components/MainMenu';
 import { RideScreen } from './components/RideScreen';
@@ -19,6 +20,8 @@ export default function App() {
 
   return (
     <div className="h-screen w-screen overflow-hidden bg-[#060412] text-slate-100">
+      <SynthwaveAudioBridge />
+
       {screen === 'menu' && <MainMenu />}
       {screen === 'library' && <WorkoutLibrary />}
       {screen === 'ride' && <RideScreen />}

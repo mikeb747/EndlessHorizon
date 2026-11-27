@@ -75,6 +75,14 @@ import {
   isAabbInFrustum,
   isSphereInFrustum,
 } from '../world/frustumCuller';
+import {
+  clampAudioVolume,
+  computeEffectiveMasterGain,
+  computeSynthwaveMixParams,
+  DEFAULT_AUDIO_MASTER_VOLUME,
+  getThemeRootOffset,
+  midiToFreq,
+} from '../audio/synthwaveMath';
 import * as THREE from 'three';
 
 test('Coggan power zones map accurately across all 7 zones', () => {
@@ -918,6 +926,120 @@ test('Island Causeway embankment and Cloud Horizon 2D cloud sprite geometry budg
     `Expected 2D cloud sprites (${spriteTriangles} tris) to be >10x cheaper than 3D (${legacy3dTriangles} tris)`
   );
 });
+
+test('synthwave audio volume clamping, gain routing, pause ducking, and zone-adaptive mix parameters', () => {
+  // Volume clamping handles out-of-range & non-finite inputs safely
+  assert.equal(clampAudioVolume(-0.5, 0.5), 0);
+  assert.equal(clampAudioVolume(1.8, 0.5), 1);
+  assert.equal(clampAudioVolume(Number.NaN, DEFAULT_AUDIO_MASTER_VOLUME), DEFAULT_AUDIO_MASTER_VOLUME);
+  assert.equal(clampAudioVolume(undefined, 0.4), 0.4);
+
+  // MIDI A4 = 69 -> 440 Hz, A3 = 57 -> 220 Hz
+  assert.ok(Math.abs(midiToFreq(69) - 440) < 1e-6);
+  assert.ok(Math.abs(midiToFreq(57) - 220) < 1e-6);
+
+  // Disabled or muted always yields 0 gain
+  assert.equal(
+    computeEffectiveMasterGain({
+      enabled: false,
+      muted: false,
+      masterVolume: 0.8,
+      menuVolume: 0.7,
+      rideVolume: 0.9,
+      screen: 'menu',
+      runState: 'idle',
+    }),
+    0
+  );
+  assert.equal(
+    computeEffectiveMasterGain({
+      enabled: true,
+      muted: true,
+      masterVolume: 0.8,
+      menuVolume: 0.7,
+      rideVolume: 0.9,
+      screen: 'ride',
+      runState: 'running',
+    }),
+    0
+  );
+
+  // Main Menu uses menuVolume; Ride uses rideVolume; full volume is perceptually capped <= 0.85
+  const menuGain = computeEffectiveMasterGain({
+    enabled: true,
+    muted: false,
+    masterVolume: 1,
+    menuVolume: 0.5,
+    rideVolume: 1,
+    screen: 'menu',
+    runState: 'idle',
+  });
+  const rideRunningGain = computeEffectiveMasterGain({
+    enabled: true,
+    muted: false,
+    masterVolume: 1,
+    menuVolume: 0.5,
+    rideVolume: 1,
+    screen: 'ride',
+    runState: 'running',
+  });
+  const ridePausedGain = computeEffectiveMasterGain({
+    enabled: true,
+    muted: false,
+    masterVolume: 1,
+    menuVolume: 0.5,
+    rideVolume: 1,
+    screen: 'ride',
+    runState: 'paused',
+  });
+
+  assert.ok(menuGain > 0 && menuGain < rideRunningGain);
+  assert.ok(rideRunningGain <= 0.85 + 1e-9);
+  assert.ok(ridePausedGain > 0 && ridePausedGain < rideRunningGain, 'Paused ride should gently duck volume');
+
+  // Menu mix is dreamy/relaxed; Ride mix scales BPM, bass pulse, arp, and filter cutoff monotonically with Coggan zone
+  const menuMix = computeSynthwaveMixParams({
+    screen: 'menu',
+    runState: 'idle',
+    zone: 2,
+    sceneryTheme: 'neon-city',
+  });
+  const rideZ1 = computeSynthwaveMixParams({
+    screen: 'ride',
+    runState: 'running',
+    zone: 1,
+    sceneryTheme: 'neon-city',
+  });
+  const rideZ4 = computeSynthwaveMixParams({
+    screen: 'ride',
+    runState: 'running',
+    zone: 4,
+    sceneryTheme: 'neon-city',
+  });
+  const rideZ7 = computeSynthwaveMixParams({
+    screen: 'ride',
+    runState: 'running',
+    zone: 7,
+    sceneryTheme: 'neon-city',
+  });
+
+  assert.equal(menuMix.bpm, 86);
+  assert.ok(rideZ1.bpm >= menuMix.bpm);
+  assert.ok(rideZ4.bpm > rideZ1.bpm && rideZ7.bpm > rideZ4.bpm);
+  assert.ok(rideZ4.filterCutoffHz > rideZ1.filterCutoffHz && rideZ7.filterCutoffHz > rideZ4.filterCutoffHz);
+  assert.ok(rideZ7.bassLevel > rideZ1.bassLevel);
+  assert.ok(rideZ7.arpLevel > menuMix.arpLevel);
+
+  // Scenery themes provide distinct musical key transpositions
+  const offsets = new Set([
+    getThemeRootOffset('neon-city'),
+    getThemeRootOffset('palm-grove'),
+    getThemeRootOffset('cloud-horizon'),
+    getThemeRootOffset('causeway-embankment'),
+  ]);
+  assert.equal(offsets.size, 4);
+});
+
 
 
 

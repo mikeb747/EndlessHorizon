@@ -1,4 +1,10 @@
 import { create } from 'zustand';
+import {
+  clampAudioVolume,
+  DEFAULT_AUDIO_MASTER_VOLUME,
+  DEFAULT_AUDIO_MENU_VOLUME,
+  DEFAULT_AUDIO_RIDE_VOLUME,
+} from '../audio/synthwaveMath';
 import { evaluateAutoPause } from '../core/autoPause';
 import { BUILT_IN_WORKOUTS, FREE_RIDE_SESSION_WORKOUT } from '../core/builtInWorkouts';
 import {
@@ -61,6 +67,11 @@ interface PersistedSettings {
   simulationEnabled: boolean;
   autoPauseEnabled: boolean;
   cadenceMatchingEnabled: boolean;
+  audioEnabled: boolean;
+  audioMuted: boolean;
+  audioMasterVolume: number;
+  audioMenuVolume: number;
+  audioRideVolume: number;
 }
 
 const STORAGE_KEY = 'neonvelo_settings_v1';
@@ -77,6 +88,11 @@ function loadPersistedSettings(): PersistedSettings {
     simulationEnabled: true,
     autoPauseEnabled: true,
     cadenceMatchingEnabled: true,
+    audioEnabled: true,
+    audioMuted: false,
+    audioMasterVolume: DEFAULT_AUDIO_MASTER_VOLUME,
+    audioMenuVolume: DEFAULT_AUDIO_MENU_VOLUME,
+    audioRideVolume: DEFAULT_AUDIO_RIDE_VOLUME,
   };
 
   if (typeof window === 'undefined') return defaults;
@@ -118,6 +134,13 @@ function loadPersistedSettings(): PersistedSettings {
         typeof parsed.cadenceMatchingEnabled === 'boolean'
           ? parsed.cadenceMatchingEnabled
           : defaults.cadenceMatchingEnabled,
+      audioEnabled:
+        typeof parsed.audioEnabled === 'boolean' ? parsed.audioEnabled : defaults.audioEnabled,
+      audioMuted:
+        typeof parsed.audioMuted === 'boolean' ? parsed.audioMuted : defaults.audioMuted,
+      audioMasterVolume: clampAudioVolume(parsed.audioMasterVolume, defaults.audioMasterVolume),
+      audioMenuVolume: clampAudioVolume(parsed.audioMenuVolume, defaults.audioMenuVolume),
+      audioRideVolume: clampAudioVolume(parsed.audioRideVolume, defaults.audioRideVolume),
     };
   } catch {
     return defaults;
@@ -150,6 +173,11 @@ export interface AppState {
   simulationEnabled: boolean;
   autoPauseEnabled: boolean;
   cadenceMatchingEnabled: boolean;
+  audioEnabled: boolean;
+  audioMuted: boolean;
+  audioMasterVolume: number;
+  audioMenuVolume: number;
+  audioRideVolume: number;
 
   // Ride mode & Free Ride state
   rideMode: RideMode;
@@ -236,6 +264,11 @@ export interface AppState {
   toggleGraph: () => void;
   setAutoPauseEnabled: (enabled: boolean) => void;
   setCadenceMatchingEnabled: (enabled: boolean) => void;
+  setAudioEnabled: (enabled: boolean) => void;
+  toggleAudioMute: () => void;
+  setAudioMasterVolume: (volume: number) => void;
+  setAudioMenuVolume: (volume: number) => void;
+  setAudioRideVolume: (volume: number) => void;
   setFps: (fps: number) => void;
 
   setSimulationEnabled: (enabled: boolean) => Promise<void>;
@@ -548,6 +581,11 @@ function persistFromStore(): void {
     simulationEnabled: s.simulationEnabled,
     autoPauseEnabled: s.autoPauseEnabled,
     cadenceMatchingEnabled: s.cadenceMatchingEnabled,
+    audioEnabled: s.audioEnabled,
+    audioMuted: s.audioMuted,
+    audioMasterVolume: s.audioMasterVolume,
+    audioMenuVolume: s.audioMenuVolume,
+    audioRideVolume: s.audioRideVolume,
   });
 }
 
@@ -566,6 +604,11 @@ export const useAppStore = create<AppState>((set, get) => ({
   simulationEnabled: initialSettings.simulationEnabled,
   autoPauseEnabled: initialSettings.autoPauseEnabled,
   cadenceMatchingEnabled: initialSettings.cadenceMatchingEnabled,
+  audioEnabled: initialSettings.audioEnabled,
+  audioMuted: initialSettings.audioMuted,
+  audioMasterVolume: initialSettings.audioMasterVolume,
+  audioMenuVolume: initialSettings.audioMenuVolume,
+  audioRideVolume: initialSettings.audioRideVolume,
 
   rideMode: 'workout',
   freeRideZone: 2,
@@ -1119,6 +1162,36 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   setCadenceMatchingEnabled: (cadenceMatchingEnabled) => {
     set({ cadenceMatchingEnabled });
+    persistFromStore();
+  },
+
+  setAudioEnabled: (audioEnabled) => {
+    set({ audioEnabled });
+    persistFromStore();
+  },
+
+  toggleAudioMute: () => {
+    const state = get();
+    if (!state.audioEnabled) {
+      set({ audioEnabled: true, audioMuted: false });
+    } else {
+      set({ audioMuted: !state.audioMuted });
+    }
+    persistFromStore();
+  },
+
+  setAudioMasterVolume: (volume) => {
+    set({ audioMasterVolume: clampAudioVolume(volume, DEFAULT_AUDIO_MASTER_VOLUME) });
+    persistFromStore();
+  },
+
+  setAudioMenuVolume: (volume) => {
+    set({ audioMenuVolume: clampAudioVolume(volume, DEFAULT_AUDIO_MENU_VOLUME) });
+    persistFromStore();
+  },
+
+  setAudioRideVolume: (volume) => {
+    set({ audioRideVolume: clampAudioVolume(volume, DEFAULT_AUDIO_RIDE_VOLUME) });
     persistFromStore();
   },
 

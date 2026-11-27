@@ -1,5 +1,5 @@
 import { useMemo } from 'react';
-import { Bluetooth, BookOpen, History, Mountain, Play, Settings, SlidersHorizontal, Zap } from 'lucide-react';
+import { Bluetooth, BookOpen, History, Mountain, Play, Settings, SlidersHorizontal, Volume2, VolumeX, Zap } from 'lucide-react';
 import { formatClock } from '../core/zones';
 import { SceneryTheme, useAppStore } from '../store/useAppStore';
 import { getBrowserCompatibility } from '../utils/browserCheck';
@@ -21,12 +21,21 @@ export function MainMenu() {
   const trainerStatus = useAppStore((s) => s.trainerStatus);
   const hrStatus = useAppStore((s) => s.hrStatus);
   const savedRidesCount = useAppStore((s) => s.savedRides.length);
+  const audioEnabled = useAppStore((s) => s.audioEnabled);
+  const audioMuted = useAppStore((s) => s.audioMuted);
+  const audioMasterVolume = useAppStore((s) => s.audioMasterVolume);
+  const audioMenuVolume = useAppStore((s) => s.audioMenuVolume);
 
   const setScreen = useAppStore((s) => s.setScreen);
   const setActiveModal = useAppStore((s) => s.setActiveModal);
   const setFtp = useAppStore((s) => s.setFtp);
   const setSceneryTheme = useAppStore((s) => s.setSceneryTheme);
   const startFreeRide = useAppStore((s) => s.startFreeRide);
+  const toggleAudioMute = useAppStore((s) => s.toggleAudioMute);
+
+  const isMenuAudioAudible =
+    audioEnabled && !audioMuted && audioMasterVolume > 0 && audioMenuVolume > 0;
+  const menuEffectivePct = Math.round(audioMasterVolume * audioMenuVolume * 100);
 
   const compat = useMemo(() => getBrowserCompatibility(), []);
 
@@ -252,14 +261,38 @@ export function MainMenu() {
               </div>
             </div>
 
-            <button
-              type="button"
-              onClick={() => setActiveModal('settings')}
-              className="min-h-[44px] w-full rounded-md bg-[#110e2d] border border-cyan-500/35 text-xs font-bold uppercase tracking-wider text-slate-200 hover:bg-cyan-500/15 flex items-center justify-center gap-2 transition-colors"
-            >
-              <Settings className="w-4 h-4" />
-              All Settings &amp; Performance Quality
-            </button>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={toggleAudioMute}
+                className={`min-h-[44px] px-3 rounded-md border text-xs font-bold uppercase tracking-wider flex items-center justify-center gap-2 transition-colors whitespace-nowrap ${
+                  isMenuAudioAudible
+                    ? 'bg-cyan-500/15 border-cyan-400/65 text-cyan-100 hover:bg-cyan-500/25'
+                    : 'bg-[#110e2d] border-slate-700 text-slate-300 hover:border-cyan-500/45'
+                }`}
+                aria-label={isMenuAudioAudible ? 'Mute synthwave audio' : 'Unmute synthwave audio'}
+                data-testid="menu-audio-toggle"
+              >
+                {isMenuAudioAudible ? <Volume2 className="w-4 h-4 text-cyan-300" /> : <VolumeX className="w-4 h-4 text-slate-400" />}
+                <span>
+                  {isMenuAudioAudible
+                    ? `Synthwave · ${menuEffectivePct}%`
+                    : !audioEnabled
+                      ? 'Audio OFF'
+                      : 'Audio Muted'}
+                </span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setActiveModal('settings')}
+                className="min-h-[44px] px-3 rounded-md bg-[#110e2d] border border-cyan-500/35 text-xs font-bold uppercase tracking-wider text-slate-200 hover:bg-cyan-500/15 flex items-center justify-center gap-2 transition-colors whitespace-nowrap"
+                data-testid="menu-open-settings"
+              >
+                <Settings className="w-4 h-4" />
+                Settings &amp; Audio
+              </button>
+            </div>
           </div>
         </div>
       </main>
