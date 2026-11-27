@@ -42,7 +42,9 @@ jobs:
       - name: Run unit tests
         run: npm test
 
-      - name: Build production bundle
+      - name: Build standalone production bundle
+        env:
+          VITE_BASE_PATH: ./
         run: npm run build
 
       - name: Upload dist build artifact
