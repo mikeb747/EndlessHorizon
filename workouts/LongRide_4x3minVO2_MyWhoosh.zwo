@@ -1,0 +1,40 @@
+<workout_file>
+  <author>Mike – Long Ride + VO2 Climbs</author>
+  <name>Long Ride 4x3min VO2 Climbs</name>
+  <description>Endurance ride with 4 x 3:00 VO2 efforts @ 115% FTP (368W) on climbs</description>
+  <sportType>bike</sportType>
+  <tags>
+    <tag name="Endurance"/>
+    <tag name="VO2Max"/>
+    <tag name="SegmentPrep"/>
+  </tags>
+
+  <workout>
+    <!-- Warm-up: 15 min progressive -->
+    <Warmup Duration="900" PowerLow="0.50" PowerHigh="0.70"/>
+
+    <!-- Endurance block before first climb -->
+    <SteadyState Duration="1800" Power="0.68" Cadence="90"/>
+
+    <!-- Climb 1 -->
+    <SteadyState Duration="180" Power="1.15" Cadence="85"/>
+    <SteadyState Duration="900" Power="0.68" Cadence="90"/>
+
+    <!-- Climb 2 -->
+    <SteadyState Duration="180" Power="1.15" Cadence="85"/>
+    <SteadyState Duration="900" Power="0.68" Cadence="90"/>
+
+    <!-- Climb 3 -->
+    <SteadyState Duration="180" Power="1.15" Cadence="85"/>
+    <SteadyState Duration="900" Power="0.68" Cadence="90"/>
+
+    <!-- Climb 4 -->
+    <SteadyState Duration="180" Power="1.15" Cadence="85"/>
+
+    <!-- Remaining endurance to complete ~3 hrs total -->
+    <SteadyState Duration="3600" Power="0.68" Cadence="90"/>
+
+    <!-- Cool-down: 10 min -->
+    <Cooldown Duration="600" PowerLow="0.60" PowerHigh="0.40"/>
+  </workout>
+</workout_file>

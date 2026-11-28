@@ -1,0 +1,21 @@
+	<workout_file>
+  <author>Mike – Endurance Ride</author>
+  <name>Endurance 90min Z2</name>
+  <description>90 min steady endurance @ Zone 2 (65–75% FTP)</description>
+  <sportType>bike</sportType>
+  <tags>
+    <tag name="Endurance"/>
+    <tag name="Aerobic"/>
+  </tags>
+
+  <workout>
+    <!-- Warm-up: 10 min ramp from 50% to 70% FTP -->
+    <Warmup Duration="600" PowerLow="0.50" PowerHigh="0.70"/>
+
+    <!-- Main set: 70 min steady Zone 2 -->
+    <SteadyState Duration="4200" Power="0.70" Cadence="90"/>
+
+    <!-- Cool-down: 10 min from 60% to 40% FTP -->
+    <Cooldown Duration="600" PowerLow="0.60" PowerHigh="0.40"/>
+  </workout>
+</workout_file>
