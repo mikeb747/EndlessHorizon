@@ -1,0 +1,35 @@
+<workout_file>
+  <author>Mike – VO2 Max 7x2min</author>
+  <name>VO2 Max 7x2 @130% FTP</name>
+  <description>7 x 2:00 @ 416W (130% FTP) with 3:00 recoveries</description>
+  <sportType>bike</sportType>
+
+  <workout>
+    <!-- Warm-up: 10 min ramp from 50% to 70% FTP -->
+    <Warmup Duration="600" PowerLow="0.50" PowerHigh="0.70"/>
+
+    <!-- Main set: 7 x (2:00 hard, 3:00 easy) -->
+    <SteadyState Duration="120" Power="1.30"/>
+    <SteadyState Duration="180" Power="0.50"/>
+
+    <SteadyState Duration="120" Power="1.30"/>
+    <SteadyState Duration="180" Power="0.50"/>
+
+    <SteadyState Duration="120" Power="1.30"/>
+    <SteadyState Duration="180" Power="0.50"/>
+
+    <SteadyState Duration="120" Power="1.30"/>
+    <SteadyState Duration="180" Power="0.50"/>
+
+    <SteadyState Duration="120" Power="1.30"/>
+    <SteadyState Duration="180" Power="0.50"/>
+
+    <SteadyState Duration="120" Power="1.30"/>
+    <SteadyState Duration="180" Power="0.50"/>
+
+    <SteadyState Duration="120" Power="1.30"/>
+
+    <!-- Cool-down: 10 min from 60% to 40% FTP -->
+    <Cooldown Duration="600" PowerLow="0.60" PowerHigh="0.40"/>
+  </workout>
+</workout_file>

@@ -1,0 +1,34 @@
+<workout_file>
+  <author>Mike – VO2 Max 3x5min</author>
+  <name>VO2 Max 3x5 @110% FTP</name>
+  <description>3 x 5:00 @ 352W (110% FTP) with 5:00 recoveries</description>
+  <sportType>bike</sportType>
+  <tags>
+    <tag name="VO2Max"/>
+    <tag name="SegmentPrep"/>
+  </tags>
+
+  <workout>
+    <!-- Warm-up: 15 min progressive with spin-ups -->
+    <SteadyState Duration="300" Power="0.50" Cadence="92"/>
+    <SteadyState Duration="300" Power="0.73" Cadence="90"/>
+    <SteadyState Duration="30" Power="1.00" Cadence="102"/>
+    <SteadyState Duration="30" Power="0.50" Cadence="85"/>
+    <SteadyState Duration="30" Power="1.00" Cadence="102"/>
+    <SteadyState Duration="30" Power="0.50" Cadence="85"/>
+    <SteadyState Duration="30" Power="1.00" Cadence="102"/>
+    <SteadyState Duration="120" Power="0.75" Cadence="90"/>
+
+    <!-- Main set: 3 x (5:00 hard, 5:00 easy) -->
+    <SteadyState Duration="300" Power="1.10" Cadence="95"/>
+    <SteadyState Duration="300" Power="0.50" Cadence="85"/>
+
+    <SteadyState Duration="300" Power="1.10" Cadence="95"/>
+    <SteadyState Duration="300" Power="0.50" Cadence="85"/>
+
+    <SteadyState Duration="300" Power="1.10" Cadence="95"/>
+
+    <!-- Cool-down: 10 min from 60% to 40% FTP -->
+    <Cooldown Duration="600" PowerLow="0.60" PowerHigh="0.40"/>
+  </workout>
+</workout_file>

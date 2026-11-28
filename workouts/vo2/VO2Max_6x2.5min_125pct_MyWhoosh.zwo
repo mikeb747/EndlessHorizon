@@ -1,0 +1,43 @@
+<workout_file>
+  <author>Mike – VO2 Max 2.5min Repeats</author>
+  <name>VO2 Max 6x2.5 @125% FTP</name>
+  <description>6 x 2:30 @ 400W with 3:00 recoveries, warm-up and cool-down included</description>
+  <sportType>bike</sportType>
+  <tags>
+    <tag name="VO2Max"/>
+    <tag name="HighIntensity"/>
+  </tags>
+
+  <workout>
+    <!-- Warm-up: 15 min progressive with spin-ups -->
+    <SteadyState Duration="300" Power="0.50" Cadence="92"/>
+    <SteadyState Duration="300" Power="0.73" Cadence="90"/>
+    <SteadyState Duration="30" Power="1.00" Cadence="102"/>
+    <SteadyState Duration="30" Power="0.50" Cadence="85"/>
+    <SteadyState Duration="30" Power="1.00" Cadence="102"/>
+    <SteadyState Duration="30" Power="0.50" Cadence="85"/>
+    <SteadyState Duration="30" Power="1.00" Cadence="102"/>
+    <SteadyState Duration="120" Power="0.75" Cadence="90"/>
+
+    <!-- Main set: 6 x (2:30 hard, 3:00 easy) -->
+    <SteadyState Duration="150" Power="1.25" Cadence="95"/>
+    <SteadyState Duration="180" Power="0.50" Cadence="85"/>
+
+    <SteadyState Duration="150" Power="1.25" Cadence="95"/>
+    <SteadyState Duration="180" Power="0.50" Cadence="85"/>
+
+    <SteadyState Duration="150" Power="1.25" Cadence="95"/>
+    <SteadyState Duration="180" Power="0.50" Cadence="85"/>
+
+    <SteadyState Duration="150" Power="1.25" Cadence="95"/>
+    <SteadyState Duration="180" Power="0.50" Cadence="85"/>
+
+    <SteadyState Duration="150" Power="1.25" Cadence="95"/>
+    <SteadyState Duration="180" Power="0.50" Cadence="85"/>
+
+    <SteadyState Duration="150" Power="1.25" Cadence="95"/>
+
+    <!-- Cool-down: 10 min -->
+    <Cooldown Duration="600" PowerLow="0.60" PowerHigh="0.40"/>
+  </workout>
+</workout_file>
