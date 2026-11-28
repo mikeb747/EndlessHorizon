@@ -6,6 +6,7 @@
  */
 
 import { calculateCaloriesFromKj, calculateLiveTss } from '../core/workoutEngine';
+import { CompiledGpsRoute, sampleCompiledRouteGps } from './gpsRoutes';
 import {
   FIT_SPORT_CYCLING,
   FIT_SUB_SPORT_VIRTUAL_ACTIVITY,
@@ -13,7 +14,7 @@ import {
   RecordedSample,
   SavedRide,
 } from './types';
-import { sampleUrashimaGps, VIRTUAL_START_ALTITUDE_M } from './virtualGps';
+import { VIRTUAL_START_ALTITUDE_M } from './virtualGps';
 
 interface ActiveLapAccumulator {
   lapIndex: number;
@@ -54,6 +55,9 @@ export interface RecordTickInput {
 export class RideRecorder {
   private workoutId = '';
   private workoutName = '';
+  private activityName = '';
+  private sceneryName = '';
+  private gpsRoute: CompiledGpsRoute | null = null;
   private ftp = 250;
   private startTimeMs: number | null = null;
   private totalTimerSec = 0;
@@ -69,6 +73,9 @@ export class RideRecorder {
 
   public reset(): void {
     this.startTimeMs = null;
+    this.activityName = '';
+    this.sceneryName = '';
+    this.gpsRoute = null;
     this.totalTimerSec = 0;
     this.distanceM = 0;
     this.altitudeM = VIRTUAL_START_ALTITUDE_M;
@@ -86,18 +93,32 @@ export class RideRecorder {
     ftp: number,
     startTimeMs = Date.now(),
     initialStepIndex = 0,
-    initialStepLabel = 'Warmup'
+    initialStepLabel = 'Warmup',
+    options?: {
+      activityName?: string;
+      sceneryName?: string;
+      gpsRoute?: CompiledGpsRoute | null;
+    }
   ): void {
     if (this.startTimeMs !== null) return;
     this.workoutId = workoutId;
     this.workoutName = workoutName;
+    this.activityName = options?.activityName || workoutName;
+    this.sceneryName = options?.sceneryName || '';
+    this.gpsRoute = options?.gpsRoute ?? null;
     this.ftp = ftp;
     this.startTimeMs = startTimeMs;
     this.activeLap = this.createLapAccumulator(0, initialStepIndex, initialStepLabel, startTimeMs);
   }
 
-  public updateMeta(ftp: number): void {
+  public updateMeta(ftp: number, activityName?: string, sceneryName?: string): void {
     this.ftp = ftp;
+    if (activityName) this.activityName = activityName;
+    if (sceneryName) this.sceneryName = sceneryName;
+  }
+
+  public setGpsRoute(route: CompiledGpsRoute | null): void {
+    this.gpsRoute = route;
   }
 
   public getStartTimeMs(): number | null {
@@ -192,7 +213,7 @@ export class RideRecorder {
     this.totalWorkKj += addedKj;
     this.totalTimerSec += dt;
 
-    const gps = sampleUrashimaGps(this.distanceM);
+    const gps = sampleCompiledRouteGps(this.gpsRoute, this.distanceM);
 
     const sample: RecordedSample = {
       timestampMs: input.timestampMs,
@@ -301,6 +322,9 @@ export class RideRecorder {
       id: `ride-${this.startTimeMs}-${Math.random().toString(36).slice(2, 7)}`,
       workoutId: this.workoutId,
       workoutName: this.workoutName,
+      activityName: this.activityName || this.workoutName,
+      sceneryName: this.sceneryName || undefined,
+      gpsRouteName: this.gpsRoute?.name ?? 'Ura-shima Loop',
       ftp: this.ftp,
       startTimeMs: this.startTimeMs,
       endTimeMs: Math.max(this.startTimeMs, endTimeMs),

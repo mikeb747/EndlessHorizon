@@ -12,6 +12,11 @@ import {
 } from '../core/freeRide';
 import { getPowerZone } from '../core/zones';
 import { ParsedWorkout } from '../core/zwoParser';
+import {
+  CompiledGpsRoute,
+  sampleCompiledRouteCurvature,
+} from '../recording/gpsRoutes';
+import { SceneryDisplayId } from '../recording/types';
 import { CadenceMatcherState, createCadenceMatcherState } from './cadenceMatcher';
 
 export const ROAD_WIDTH = 7.4;
@@ -23,6 +28,10 @@ export const ROAD_Z_FAR = -265;
 export const ROAD_Z_SPAN = ROAD_Z_NEAR - ROAD_Z_FAR; // 272.5 m
 /** Adaptive non-linear LOD segment count (denser near camera, coarser toward horizon for 60fps). */
 export const ROAD_SEGMENTS = 56;
+/** Pre-allocated forward curve LUT resolution for GPS Art in-game corners (zero per-frame GC). */
+export const CURVE_LUT_SAMPLES = 65;
+/** Max visual heading sweep toward horizon (~51.5 deg) so 180-deg GPS hairpins stay sharp & playable. */
+export const MAX_VISIBLE_HEADING_RAD = 0.9;
 
 /** Camera depth-buffer precision planes (higher near improves 24-bit depth precision ~4.5x). */
 export const WORLD_CAMERA_NEAR = 0.45;
@@ -182,17 +191,17 @@ export const REF_ROAD_SPEED_MPS = 10.0;
 /**
  * Map Coggan Power Zone (1..7) to exact in-game road gradient (rise / run):
  * - Zone 1: Flat (0%)
- * - Zone 2: Gentle incline (2%)
- * - Zone 3: Slight incline (4%)
- * - Zone 4: Threshold climb (8%)
- * - Zone 5+: Steep mountain climb (20%)
+ * - Zone 2: Gentle incline (3%)
+ * - Zone 3: Tempo incline (6%)
+ * - Zone 4: Threshold climb (10%)
+ * - Zone 5+: Steep mountain climb (22%, and +10% steeper = 32% on Neon City)
  */
-export function getZoneGradient(zoneNumber: number): number {
+export function getZoneGradient(zoneNumber: number, sceneryTheme?: SceneryDisplayId): number {
   if (zoneNumber <= 1) return 0.0;
-  if (zoneNumber === 2) return 0.02;
-  if (zoneNumber === 3) return 0.04;
-  if (zoneNumber === 4) return 0.08;
-  return 0.2;
+  if (zoneNumber === 2) return 0.03;
+  if (zoneNumber === 3) return 0.06;
+  if (zoneNumber === 4) return 0.1;
+  return sceneryTheme === 'neon-city' ? 0.32 : 0.22;
 }
 
 export interface WorkoutElevationProfile {
@@ -209,7 +218,10 @@ export interface WorkoutElevationProfile {
  * timeline. Runs once per workout load (O(N) ~3300 floats) so every 60 fps road vertex
  * sample is O(1) with zero per-frame allocations.
  */
-export function buildWorkoutElevationProfile(workout: ParsedWorkout): WorkoutElevationProfile {
+export function buildWorkoutElevationProfile(
+  workout: ParsedWorkout,
+  sceneryTheme?: SceneryDisplayId
+): WorkoutElevationProfile {
   const totalSec = Math.max(1, Math.ceil(workout.totalDuration));
   const rawGrade = new Float32Array(totalSec + 1);
   const timeline = workout.timeline;
@@ -231,7 +243,7 @@ export function buildWorkoutElevationProfile(workout: ParsedWorkout): WorkoutEle
         ? step.powerLow
         : step.powerLow + (step.powerHigh - step.powerLow) * progress;
     const zone = getPowerZone(powerFraction);
-    rawGrade[t] = getZoneGradient(zone.zone);
+    rawGrade[t] = getZoneGradient(zone.zone, sceneryTheme);
   }
 
   // Smooth gradient transitions over a gentle 3-second centered moving window so
@@ -315,6 +327,91 @@ export interface RoadSample {
 
 const _sampleOut: RoadSample = { x: 0, y: 0, slopeX: 0, slopeY: 0 };
 
+let _activeRoadCurveSource: WorldRuntimeState | null = null;
+
+/**
+ * Bind the active WorldRuntimeState curve LUT once per frame in SceneDriver so every
+ * road strip, sidewalk, building, palm, embankment, and finish sign automatically follows
+ * the exact same GPS Art corners with O(1) lookup and zero per-frame allocations.
+ */
+export function setActiveRoadCurveSource(rt: WorldRuntimeState | null): void {
+  _activeRoadCurveSource = rt;
+}
+
+/**
+ * Integrate bounded GPS Art route curvature into the pre-allocated road curve LUT
+ * from local Z = 0 forward to ROAD_Z_FAR and backward to ROAD_Z_NEAR.
+ * Tight 180° GPS hairpins are smoothly bounded via tanh into dramatic, playable 3D bends.
+ */
+export function updateRoadCurveLut(rt: WorldRuntimeState): void {
+  const route = rt.gpsRoute;
+  if (!route) {
+    rt.curveLutReady = false;
+    rt.currentCurvature = 0;
+    return;
+  }
+
+  const n = rt.curveLutX.length;
+  const maxIdx = n - 1;
+  const dz = ROAD_Z_SPAN / maxIdx;
+  const uZero = ROAD_Z_NEAR / ROAD_Z_SPAN;
+  const idxZero = uZero * maxIdx;
+  const iFwdStart = Math.ceil(idxZero);
+  const iBackStart = Math.floor(idxZero);
+
+  // Forward integration from z = 0 (x = 0, heading = 0) toward ROAD_Z_FAR (-265m)
+  let theta = 0;
+  let x = 0;
+  let prevSlope = 0;
+  let prevAhead = 0;
+
+  for (let i = iFwdStart; i < n; i++) {
+    const z = ROAD_Z_NEAR - i * dz;
+    const ahead = -z; // >= 0
+    const ds = ahead - prevAhead;
+    if (ds > 0) {
+      const k = sampleCompiledRouteCurvature(route, rt.distance + prevAhead + ds * 0.5);
+      theta += k * ds;
+      const clampedHeading =
+        MAX_VISIBLE_HEADING_RAD * Math.tanh(theta / MAX_VISIBLE_HEADING_RAD);
+      const slope = Math.tan(clampedHeading);
+      x += 0.5 * (prevSlope + slope) * ds;
+      prevSlope = slope;
+      prevAhead = ahead;
+    }
+    rt.curveLutX[i] = x;
+    rt.curveLutSlopeX[i] = prevSlope;
+  }
+
+  // Backward integration from z = 0 toward ROAD_Z_NEAR (+7.5m behind rider)
+  theta = 0;
+  x = 0;
+  prevSlope = 0;
+  let prevBehind = 0;
+
+  for (let i = iBackStart; i >= 0; i--) {
+    const z = ROAD_Z_NEAR - i * dz;
+    const behind = Math.max(0, z);
+    const ds = behind - prevBehind;
+    if (ds > 0) {
+      const k = sampleCompiledRouteCurvature(route, Math.max(0, rt.distance - prevBehind - ds * 0.5));
+      theta -= k * ds;
+      const clampedHeading =
+        MAX_VISIBLE_HEADING_RAD * Math.tanh(theta / MAX_VISIBLE_HEADING_RAD);
+      const slope = Math.tan(clampedHeading);
+      x -= 0.5 * (prevSlope + slope) * ds;
+      prevSlope = slope;
+      prevBehind = behind;
+    }
+    rt.curveLutX[i] = x;
+    rt.curveLutSlopeX[i] = prevSlope;
+  }
+
+  // Look slightly ahead (+8m) so cyclist lean anticipates the corner cleanly
+  rt.currentCurvature = sampleCompiledRouteCurvature(route, rt.distance + 8);
+  rt.curveLutReady = true;
+}
+
 /**
  * Evaluate road centerline offset (x, y) at a local Z coordinate (z <= 0 is ahead of cyclist)
  * given the rider's cumulative forward distance in meters and optional workout elevation profile.
@@ -326,18 +423,33 @@ export function sampleRoadAtZ(
   target: RoadSample = _sampleOut,
   elevationProfile: WorkoutElevationProfile | null = null,
   workoutElapsedSec = 0,
-  freeRideTerrain: FreeRideTerrainProfile | null = null
+  freeRideTerrain: FreeRideTerrainProfile | null = null,
+  curveSource?: WorldRuntimeState | null
 ): RoadSample {
   const aheadDist = -localZ; // positive ahead of bike
   const s = worldDistance + aheadDist;
 
-  const baseX = rawCurveX(worldDistance);
-  const baseDx = rawCurveDerivX(worldDistance);
+  const activeCurve = curveSource !== undefined ? curveSource : _activeRoadCurveSource;
+  if (activeCurve && activeCurve.curveLutReady) {
+    const lutX = activeCurve.curveLutX;
+    const lutSlope = activeCurve.curveLutSlopeX;
+    const maxIdx = lutX.length - 1;
+    const t = Math.max(0, Math.min(1, (ROAD_Z_NEAR - localZ) / ROAD_Z_SPAN));
+    const f = t * maxIdx;
+    const i0 = Math.floor(f);
+    const i1 = Math.min(maxIdx, i0 + 1);
+    const frac = f - i0;
+    target.x = lutX[i0] + (lutX[i1] - lutX[i0]) * frac;
+    target.slopeX = lutSlope[i0] + (lutSlope[i1] - lutSlope[i0]) * frac;
+  } else {
+    const baseX = rawCurveX(worldDistance);
+    const baseDx = rawCurveDerivX(worldDistance);
 
-  // Subtract tangent at bike position so local road leaves (0,0,0) heading straight -Z
-  // and gently curves into the distance
-  target.x = rawCurveX(s) - baseX - baseDx * aheadDist * 0.55;
-  target.slopeX = rawCurveDerivX(s) - baseDx * 0.55;
+    // Subtract tangent at bike position so local road leaves (0,0,0) heading straight -Z
+    // and gently curves into the distance
+    target.x = rawCurveX(s) - baseX - baseDx * aheadDist * 0.55;
+    target.slopeX = rawCurveDerivX(s) - baseDx * 0.55;
+  }
 
   if (freeRideTerrain) {
     const baseElev = sampleFreeRideElevation(freeRideTerrain, worldDistance);
@@ -360,12 +472,31 @@ export function sampleRoadAtZ(
 }
 
 /**
- * Smooth banking angle (radians) for the cyclist leaning into curves.
+ * Smooth banking curvature signal for the default non-GPS road spline.
+ * Positive values indicate a right-hand turn (+X ahead), negative indicate left-hand (-X ahead).
  */
 export function getRoadCurvatureAt(worldDistance: number): number {
   const d1 = rawCurveDerivX(worldDistance);
   const d2 = rawCurveDerivX(worldDistance + 12);
   return (d2 - d1) * 1.35;
+}
+
+/**
+ * Compute bike Z-axis roll angle (radians) for leaning INTO corners.
+ * In Three.js right-handed coordinates facing -Z (+X right, +Y up, +Z toward camera):
+ * - Right turn (curvature > 0) requires NEGATIVE rotation.z so the top of the bike tilts RIGHT (+X).
+ * - Left turn (curvature < 0) requires POSITIVE rotation.z so the top of the bike tilts LEFT (-X).
+ */
+export function computeCornerLeanAngle(
+  curvature: number,
+  isGpsRoute: boolean,
+  speedMps: number
+): number {
+  if (speedMps <= 0.5 || !Number.isFinite(curvature)) return 0;
+  const maxLean = isGpsRoute ? 0.28 : 0.22;
+  const scaled = isGpsRoute ? curvature * 14.5 : curvature;
+  const clamped = Math.max(-maxLean, Math.min(maxLean, scaled));
+  return -clamped;
 }
 
 /**
@@ -396,6 +527,12 @@ export interface WorldRuntimeState {
   currentGrade: number; // smoothed rise/run gradient (-0.14..0.20)
   pitchAngle: number; // atan(currentGrade) radians
   finishPassDist: number; // meters past the finish line during post-completion coast
+  // GPS Art route corner LUT (pre-allocated once, updated per frame in SceneDriver)
+  gpsRoute: CompiledGpsRoute | null;
+  curveLutReady: boolean;
+  curveLutX: Float32Array;
+  curveLutSlopeX: Float32Array;
+  currentCurvature: number;
   // Shared per-frame camera frustum planes (6 planes * 4 floats) & live culling telemetry
   frustumPlanes: Float32Array;
   frustumReady: boolean;
@@ -429,6 +566,11 @@ export function createWorldRuntime(): WorldRuntimeState {
     currentGrade: 0,
     pitchAngle: 0,
     finishPassDist: 0,
+    gpsRoute: null,
+    curveLutReady: false,
+    curveLutX: new Float32Array(CURVE_LUT_SAMPLES),
+    curveLutSlopeX: new Float32Array(CURVE_LUT_SAMPLES),
+    currentCurvature: 0,
     frustumPlanes: new Float32Array(24),
     frustumReady: false,
     cameraZ: 4.7,

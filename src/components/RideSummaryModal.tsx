@@ -9,10 +9,12 @@ import {
   Home,
   Mountain,
   RotateCcw,
+  Route,
 } from 'lucide-react';
 import { formatClock } from '../core/zones';
 import { downloadRideFitFile } from '../recording/rideStorage';
 import { useAppStore } from '../store/useAppStore';
+import { GpsRoutePreviewSvg } from './GpsRoutePreviewSvg';
 
 function formatStartTime(ms: number | null): string {
   if (!ms) return '--';
@@ -87,8 +89,9 @@ export function RideSummaryModal() {
               <h2
                 id="summary-modal-title"
                 className="font-display text-lg sm:text-xl font-extrabold text-white truncate"
+                data-testid="summary-activity-name"
               >
-                {lastCompletedRide?.workoutName ?? activeWorkout.name}
+                {lastCompletedRide?.activityName ?? lastCompletedRide?.workoutName ?? activeWorkout.name}
               </h2>
               <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-slate-400 mt-0.5">
                 <span className="inline-flex items-center gap-1">
@@ -96,7 +99,7 @@ export function RideSummaryModal() {
                   Started {startTimeLabel}
                 </span>
                 <span>·</span>
-                <span>Ura-shima Virtual GPS</span>
+                <span>{lastCompletedRide?.gpsRouteName ?? 'Ura-shima Virtual GPS'}</span>
                 <span>·</span>
                 <span>{laps.length} {laps.length === 1 ? 'Lap' : 'Laps'}</span>
               </div>
@@ -175,6 +178,31 @@ export function RideSummaryModal() {
               </div>
             </div>
           </div>
+
+          {/* Recorded 1:1 GPS Track Preview */}
+          {lastCompletedRide && lastCompletedRide.records.length >= 2 && (
+            <div
+              className="rounded-lg bg-[#08061a] border border-cyan-500/30 p-3 space-y-1.5"
+              data-testid="summary-gps-plot"
+            >
+              <div className="flex items-center justify-between text-xs font-bold uppercase tracking-wider text-slate-300">
+                <span className="flex items-center gap-1.5">
+                  <Route className="w-3.5 h-3.5 text-cyan-300" />
+                  Recorded GPS Track ({lastCompletedRide.gpsRouteName ?? 'Ura-shima Loop'})
+                </span>
+                <span className="text-[11px] font-normal text-slate-400 normal-case">
+                  1:1 Conformal GPS Plot
+                </span>
+              </div>
+              <div className="rounded bg-[#050312] border border-cyan-500/20 p-1.5">
+                <GpsRoutePreviewSvg
+                  gpsRecords={lastCompletedRide.records}
+                  height={92}
+                  label="Recorded 1:1 GPS track plot"
+                />
+              </div>
+            </div>
+          )}
 
           {/* Recorded Laps Table (split at each workout step change) */}
           {laps.length > 0 && (

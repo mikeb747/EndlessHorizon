@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { MusicFollowMode, MusicZone } from '../audio/musicEngineLogic';
 import {
   clampAudioVolume,
   DEFAULT_AUDIO_MASTER_VOLUME,
@@ -30,13 +31,23 @@ import {
   TrainerStatusSnapshot,
 } from '../devices/types';
 import { WorkoutEngine, WorkoutTickEvent } from '../logic/WorkoutEngine';
+import {
+  buildActiveGpsRoute,
+  CompiledGpsRoute,
+  GpsRoutePresetId,
+} from '../recording/gpsRoutes';
+import type { NormalizedPoint } from '../recording/lineArtTracer';
 import { RideRecorder } from '../recording/rideRecorder';
 import {
   deleteSavedRide,
   listSavedRides,
   saveCompletedRide,
 } from '../recording/rideStorage';
-import { SavedRide } from '../recording/types';
+import {
+  formatFitActivityName,
+  getSceneryDisplayName,
+  SavedRide,
+} from '../recording/types';
 import { VIRTUAL_START_ALTITUDE_M } from '../recording/virtualGps';
 import { getBrowserCompatibility } from '../utils/browserCheck';
 import { wakeLockController } from '../utils/wakeLock';
@@ -45,9 +56,17 @@ import { getZoneGradient } from '../world/roadMath';
 export type AppScreen = 'menu' | 'library' | 'ride';
 export type ModalType = 'devices' | 'settings' | 'summary' | 'rides' | null;
 export type SceneryTheme = 'neon-city' | 'palm-grove' | 'cloud-horizon' | 'causeway-embankment';
+export type SceneryCycleMinutes = 0 | 5 | 10 | 15;
 export type QualityLevel = 'low' | 'medium' | 'high';
 export type WorkoutRunState = 'idle' | 'running' | 'paused' | 'completed';
 export type RideMode = 'workout' | 'freeride';
+
+export const SCENERY_CYCLE_ORDER: readonly SceneryTheme[] = [
+  'neon-city',
+  'palm-grove',
+  'cloud-horizon',
+  'causeway-embankment',
+];
 
 export interface RideHistorySample {
   timeSec: number;
@@ -60,6 +79,12 @@ export interface RideHistorySample {
 interface PersistedSettings {
   ftp: number;
   sceneryTheme: SceneryTheme;
+  sceneryCycleMinutes: SceneryCycleMinutes;
+  gpsRoutePreset: GpsRoutePresetId;
+  gpsRouteTargetKm: number;
+  customGpsRouteName: string;
+  customGpsRoutePoints: NormalizedPoint[];
+  customGpsRouteClosed: boolean;
   quality: QualityLevel;
   showHoloCards: boolean;
   showFps: boolean;
@@ -72,6 +97,7 @@ interface PersistedSettings {
   audioMasterVolume: number;
   audioMenuVolume: number;
   audioRideVolume: number;
+  musicFollowMode: MusicFollowMode;
 }
 
 const STORAGE_KEY = 'neonvelo_settings_v1';
@@ -81,6 +107,12 @@ function loadPersistedSettings(): PersistedSettings {
   const defaults: PersistedSettings = {
     ftp: 250,
     sceneryTheme: 'neon-city',
+    sceneryCycleMinutes: 0,
+    gpsRoutePreset: 'bike-line-art',
+    gpsRouteTargetKm: 15,
+    customGpsRouteName: '',
+    customGpsRoutePoints: [],
+    customGpsRouteClosed: false,
     quality: isTouchDevice ? 'medium' : 'high',
     showHoloCards: true,
     showFps: false,
@@ -93,6 +125,7 @@ function loadPersistedSettings(): PersistedSettings {
     audioMasterVolume: DEFAULT_AUDIO_MASTER_VOLUME,
     audioMenuVolume: DEFAULT_AUDIO_MENU_VOLUME,
     audioRideVolume: DEFAULT_AUDIO_RIDE_VOLUME,
+    musicFollowMode: 'target',
   };
 
   if (typeof window === 'undefined') return defaults;
@@ -112,6 +145,46 @@ function loadPersistedSettings(): PersistedSettings {
         parsed.sceneryTheme === 'causeway-embankment'
           ? parsed.sceneryTheme
           : defaults.sceneryTheme,
+      sceneryCycleMinutes:
+        parsed.sceneryCycleMinutes === 0 ||
+        parsed.sceneryCycleMinutes === 5 ||
+        parsed.sceneryCycleMinutes === 10 ||
+        parsed.sceneryCycleMinutes === 15
+          ? parsed.sceneryCycleMinutes
+          : defaults.sceneryCycleMinutes,
+      gpsRoutePreset:
+        parsed.gpsRoutePreset === 'urashima-loop' ||
+        parsed.gpsRoutePreset === 'bike-line-art' ||
+        parsed.gpsRoutePreset === 'custom-drawing'
+          ? parsed.gpsRoutePreset
+          : defaults.gpsRoutePreset,
+      gpsRouteTargetKm:
+        typeof parsed.gpsRouteTargetKm === 'number' &&
+        Number.isFinite(parsed.gpsRouteTargetKm) &&
+        parsed.gpsRouteTargetKm >= 0 &&
+        parsed.gpsRouteTargetKm <= 120
+          ? Math.round(parsed.gpsRouteTargetKm)
+          : defaults.gpsRouteTargetKm,
+      customGpsRouteName:
+        typeof parsed.customGpsRouteName === 'string'
+          ? parsed.customGpsRouteName.slice(0, 64)
+          : defaults.customGpsRouteName,
+      customGpsRoutePoints: Array.isArray(parsed.customGpsRoutePoints)
+        ? parsed.customGpsRoutePoints
+            .filter(
+              (p): p is NormalizedPoint =>
+                Boolean(p) &&
+                typeof p.x === 'number' &&
+                typeof p.y === 'number' &&
+                Number.isFinite(p.x) &&
+                Number.isFinite(p.y)
+            )
+            .slice(0, 600)
+        : defaults.customGpsRoutePoints,
+      customGpsRouteClosed:
+        typeof parsed.customGpsRouteClosed === 'boolean'
+          ? parsed.customGpsRouteClosed
+          : defaults.customGpsRouteClosed,
       quality:
         parsed.quality === 'low' || parsed.quality === 'medium' || parsed.quality === 'high'
           ? parsed.quality
@@ -141,6 +214,10 @@ function loadPersistedSettings(): PersistedSettings {
       audioMasterVolume: clampAudioVolume(parsed.audioMasterVolume, defaults.audioMasterVolume),
       audioMenuVolume: clampAudioVolume(parsed.audioMenuVolume, defaults.audioMenuVolume),
       audioRideVolume: clampAudioVolume(parsed.audioRideVolume, defaults.audioRideVolume),
+      musicFollowMode:
+        parsed.musicFollowMode === 'target' || parsed.musicFollowMode === 'actual'
+          ? parsed.musicFollowMode
+          : defaults.musicFollowMode,
     };
   } catch {
     return defaults;
@@ -166,6 +243,12 @@ export interface AppState {
   ftp: number;
   intensityOffsetPct: number;
   sceneryTheme: SceneryTheme;
+  sceneryCycleMinutes: SceneryCycleMinutes;
+  gpsRoutePreset: GpsRoutePresetId;
+  gpsRouteTargetKm: number;
+  customGpsRouteName: string;
+  customGpsRoutePoints: NormalizedPoint[];
+  customGpsRouteClosed: boolean;
   quality: QualityLevel;
   showHoloCards: boolean;
   showFps: boolean;
@@ -178,6 +261,13 @@ export interface AppState {
   audioMasterVolume: number;
   audioMenuVolume: number;
   audioRideVolume: number;
+  musicFollowMode: MusicFollowMode;
+  musicTestZone: MusicZone | null;
+
+  // Derived GPS Art route & mid-ride scenery tracking
+  activeGpsRoute: CompiledGpsRoute | null;
+  visitedSceneries: SceneryTheme[];
+  sceneryCycleElapsedSec: number;
 
   // Ride mode & Free Ride state
   rideMode: RideMode;
@@ -257,6 +347,11 @@ export interface AppState {
   adjustIntensity: (deltaPct: number) => void;
   resetIntensityOffset: () => void;
   setSceneryTheme: (theme: SceneryTheme) => void;
+  setSceneryCycleMinutes: (minutes: SceneryCycleMinutes) => void;
+  cycleNextScenery: () => void;
+  setGpsRoutePreset: (preset: GpsRoutePresetId) => void;
+  setGpsRouteTargetKm: (km: number) => void;
+  setCustomGpsRoute: (name: string, points: NormalizedPoint[], closedLoop: boolean) => void;
   setQuality: (quality: QualityLevel) => void;
   setShowHoloCards: (show: boolean) => void;
   setShowFps: (show: boolean) => void;
@@ -269,6 +364,8 @@ export interface AppState {
   setAudioMasterVolume: (volume: number) => void;
   setAudioMenuVolume: (volume: number) => void;
   setAudioRideVolume: (volume: number) => void;
+  setMusicFollowMode: (mode: MusicFollowMode) => void;
+  setMusicTestZone: (zone: MusicZone | null) => void;
   setFps: (fps: number) => void;
 
   setSimulationEnabled: (enabled: boolean) => Promise<void>;
@@ -282,6 +379,7 @@ export interface AppState {
   disconnectCadence: () => Promise<void>;
   refreshSavedRides: () => Promise<void>;
   deleteSavedRideById: (rideId: string) => Promise<void>;
+  markRideUploadedToStrava: (rideId: string, stravaActivityId?: number | null) => Promise<void>;
   initSession: () => void;
 }
 
@@ -308,6 +406,73 @@ const initialFreeRideTargetWatts = computeFreeRideTargetWatts(
   0,
   initialFreeRideGrade
 );
+
+function resolveTargetDistanceKm(
+  targetKm: number,
+  rideMode: RideMode,
+  workoutDurationSec: number
+): number {
+  if (targetKm > 0) return targetKm;
+  // Auto-Fit (0): estimate realistic ride distance (~32 km/h) for workout duration, or 15 km for Free Ride
+  if (rideMode === 'workout' && workoutDurationSec > 0) {
+    return Math.max(3, Math.round(((workoutDurationSec / 3600) * 32) * 10) / 10);
+  }
+  return 15;
+}
+
+function compileActiveRouteFromConfig(cfg: {
+  gpsRoutePreset: GpsRoutePresetId;
+  gpsRouteTargetKm: number;
+  customGpsRouteName: string;
+  customGpsRoutePoints: NormalizedPoint[];
+  customGpsRouteClosed: boolean;
+  rideMode: RideMode;
+  workoutDurationSec: number;
+}): CompiledGpsRoute | null {
+  return buildActiveGpsRoute({
+    presetId: cfg.gpsRoutePreset,
+    targetDistanceKm: resolveTargetDistanceKm(
+      cfg.gpsRouteTargetKm,
+      cfg.rideMode,
+      cfg.workoutDurationSec
+    ),
+    customName: cfg.customGpsRouteName,
+    customPoints: cfg.customGpsRoutePoints,
+    customClosedLoop: cfg.customGpsRouteClosed,
+  });
+}
+
+const initialActiveGpsRoute = compileActiveRouteFromConfig({
+  gpsRoutePreset: initialSettings.gpsRoutePreset,
+  gpsRouteTargetKm: initialSettings.gpsRouteTargetKm,
+  customGpsRouteName: initialSettings.customGpsRouteName,
+  customGpsRoutePoints: initialSettings.customGpsRoutePoints,
+  customGpsRouteClosed: initialSettings.customGpsRouteClosed,
+  rideMode: 'workout',
+  workoutDurationSec: initialWorkout.totalDuration,
+});
+
+function buildCurrentActivityMeta(state: {
+  rideMode: RideMode;
+  activeWorkout: ParsedWorkout;
+  sceneryTheme: SceneryTheme;
+  visitedSceneries: SceneryTheme[];
+}): { activityName: string; sceneryName: string } {
+  const visited =
+    state.visitedSceneries.length > 0 ? state.visitedSceneries : [state.sceneryTheme];
+  const unique = Array.from(new Set(visited));
+  const sceneryName =
+    unique.length > 1
+      ? `${getSceneryDisplayName(unique[0])} + ${unique.length - 1} Worlds`
+      : getSceneryDisplayName(unique[0] ?? state.sceneryTheme);
+  const activityName = formatFitActivityName({
+    rideMode: state.rideMode,
+    workoutName: state.activeWorkout.name,
+    sceneryTheme: state.sceneryTheme,
+    visitedSceneries: unique,
+  });
+  return { activityName, sceneryName };
+}
 
 function finalizeAndPersistCurrentRide(endTimeMs = Date.now()): SavedRide | null {
   const completed = rideRecorder.finalize(endTimeMs);
@@ -443,7 +608,7 @@ function handleEngineStateUpdate(event: WorkoutTickEvent): void {
 
   // Compute live target watts and road grade based on ride mode
   let targetWatts = event.snapshot.targetWatts;
-  let gradePct = getZoneGradient(event.snapshot.zone.zone) * 100;
+  let gradePct = getZoneGradient(event.snapshot.zone.zone, state.sceneryTheme) * 100;
   let nextFreeRideGrade = state.freeRideGrade;
   let nextFreeRideTargetWatts = state.freeRideTargetWatts;
   let stepIndexForRecord = event.snapshot.stepIndex;
@@ -505,6 +670,31 @@ function handleEngineStateUpdate(event: WorkoutTickEvent): void {
     stepLabel: stepLabelForRecord,
   });
 
+  // Optional mid-ride automatic scenery rotation (Off / 5 min / 10 min / 15 min)
+  let nextSceneryTheme = state.sceneryTheme;
+  let nextVisitedSceneries = state.visitedSceneries;
+  let nextCycleElapsedSec = state.sceneryCycleElapsedSec;
+
+  if (state.sceneryCycleMinutes > 0 && state.runState === 'running') {
+    nextCycleElapsedSec += dtSec;
+    const cyclePeriodSec = state.sceneryCycleMinutes * 60;
+    if (nextCycleElapsedSec >= cyclePeriodSec) {
+      nextCycleElapsedSec = 0;
+      const curIdx = SCENERY_CYCLE_ORDER.indexOf(state.sceneryTheme);
+      nextSceneryTheme = SCENERY_CYCLE_ORDER[(curIdx + 1) % SCENERY_CYCLE_ORDER.length];
+      nextVisitedSceneries = state.visitedSceneries.includes(nextSceneryTheme)
+        ? state.visitedSceneries
+        : [...state.visitedSceneries, nextSceneryTheme];
+      const meta = buildCurrentActivityMeta({
+        rideMode: state.rideMode,
+        activeWorkout: state.activeWorkout,
+        sceneryTheme: nextSceneryTheme,
+        visitedSceneries: nextVisitedSceneries,
+      });
+      rideRecorder.updateMeta(state.ftp, meta.activityName, meta.sceneryName);
+    }
+  }
+
   useAppStore.setState({
     elapsedSec: event.elapsedSec,
     activeSnapshot: event.snapshot,
@@ -516,6 +706,9 @@ function handleEngineStateUpdate(event: WorkoutTickEvent): void {
     zeroPedalSec: autoPauseEval.zeroPedalSec,
     freeRideGrade: nextFreeRideGrade,
     freeRideTargetWatts: nextFreeRideTargetWatts,
+    sceneryTheme: nextSceneryTheme,
+    visitedSceneries: nextVisitedSceneries,
+    sceneryCycleElapsedSec: nextCycleElapsedSec,
     rideStartTimeMs: rideRecorder.getStartTimeMs(),
     rideDistanceM: rideRecorder.getDistanceM(),
     rideAltitudeM: rideRecorder.getAltitudeM(),
@@ -574,6 +767,12 @@ function persistFromStore(): void {
   savePersistedSettings({
     ftp: s.ftp,
     sceneryTheme: s.sceneryTheme,
+    sceneryCycleMinutes: s.sceneryCycleMinutes,
+    gpsRoutePreset: s.gpsRoutePreset,
+    gpsRouteTargetKm: s.gpsRouteTargetKm,
+    customGpsRouteName: s.customGpsRouteName,
+    customGpsRoutePoints: s.customGpsRoutePoints,
+    customGpsRouteClosed: s.customGpsRouteClosed,
     quality: s.quality,
     showHoloCards: s.showHoloCards,
     showFps: s.showFps,
@@ -586,6 +785,7 @@ function persistFromStore(): void {
     audioMasterVolume: s.audioMasterVolume,
     audioMenuVolume: s.audioMenuVolume,
     audioRideVolume: s.audioRideVolume,
+    musicFollowMode: s.musicFollowMode,
   });
 }
 
@@ -597,6 +797,12 @@ export const useAppStore = create<AppState>((set, get) => ({
   ftp: initialSettings.ftp,
   intensityOffsetPct: 0,
   sceneryTheme: initialSettings.sceneryTheme,
+  sceneryCycleMinutes: initialSettings.sceneryCycleMinutes,
+  gpsRoutePreset: initialSettings.gpsRoutePreset,
+  gpsRouteTargetKm: initialSettings.gpsRouteTargetKm,
+  customGpsRouteName: initialSettings.customGpsRouteName,
+  customGpsRoutePoints: initialSettings.customGpsRoutePoints,
+  customGpsRouteClosed: initialSettings.customGpsRouteClosed,
   quality: initialSettings.quality,
   showHoloCards: initialSettings.showHoloCards,
   showFps: initialSettings.showFps,
@@ -609,6 +815,12 @@ export const useAppStore = create<AppState>((set, get) => ({
   audioMasterVolume: initialSettings.audioMasterVolume,
   audioMenuVolume: initialSettings.audioMenuVolume,
   audioRideVolume: initialSettings.audioRideVolume,
+  musicFollowMode: initialSettings.musicFollowMode,
+  musicTestZone: null,
+
+  activeGpsRoute: initialActiveGpsRoute,
+  visitedSceneries: [initialSettings.sceneryTheme],
+  sceneryCycleElapsedSec: 0,
 
   rideMode: 'workout',
   freeRideZone: 2,
@@ -708,22 +920,39 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   setScreen: (screen) => set({ screen }),
-  setActiveModal: (activeModal) => set({ activeModal }),
+  setActiveModal: (activeModal) =>
+    set((state) => ({
+      activeModal,
+      musicTestZone: activeModal === 'settings' ? state.musicTestZone : null,
+    })),
   setLeftDrawerOpen: (leftDrawerOpen) => set({ leftDrawerOpen }),
 
   selectWorkout: (workoutId, openRide = false) => {
-    const found = get().workouts.find((w) => w.id === workoutId);
+    const state = get();
+    const found = state.workouts.find((w) => w.id === workoutId);
     if (!found) return;
     clearFinishSummaryTimer();
     rollingPower.reset();
     rideRecorder.reset();
     const snap = workoutEngine.loadWorkout(found, {
-      ftp: get().ftp,
-      intensityOffsetPct: get().intensityOffsetPct,
+      ftp: state.ftp,
+      intensityOffsetPct: state.intensityOffsetPct,
+    });
+    const activeGpsRoute = compileActiveRouteFromConfig({
+      gpsRoutePreset: state.gpsRoutePreset,
+      gpsRouteTargetKm: state.gpsRouteTargetKm,
+      customGpsRouteName: state.customGpsRouteName,
+      customGpsRoutePoints: state.customGpsRoutePoints,
+      customGpsRouteClosed: state.customGpsRouteClosed,
+      rideMode: 'workout',
+      workoutDurationSec: found.totalDuration,
     });
     set({
       rideMode: 'workout',
       activeWorkout: found,
+      activeGpsRoute,
+      visitedSceneries: [state.sceneryTheme],
+      sceneryCycleElapsedSec: 0,
       runState: 'idle',
       elapsedSec: 0,
       activeSnapshot: snap,
@@ -740,7 +969,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       rideAscentM: 0,
       rideLapCount: 0,
       intervalPulseCount: 0,
-      screen: openRide ? 'ride' : get().screen,
+      screen: openRide ? 'ride' : state.screen,
     });
   },
 
@@ -748,16 +977,29 @@ export const useAppStore = create<AppState>((set, get) => ({
     clearFinishSummaryTimer();
     rollingPower.reset();
     rideRecorder.reset();
+    const state = get();
     const terrain = createFreeRideTerrain();
     const grade = sampleFreeRideGrade(terrain, 0);
-    const ftp = get().ftp;
+    const ftp = state.ftp;
     const targetWatts = computeFreeRideTargetWatts(initialZone, ftp, 0, grade);
     const snap = workoutEngine.loadWorkout(FREE_RIDE_SESSION_WORKOUT, {
       ftp,
       intensityOffsetPct: 0,
     });
+    const activeGpsRoute = compileActiveRouteFromConfig({
+      gpsRoutePreset: state.gpsRoutePreset,
+      gpsRouteTargetKm: state.gpsRouteTargetKm,
+      customGpsRouteName: state.customGpsRouteName,
+      customGpsRoutePoints: state.customGpsRoutePoints,
+      customGpsRouteClosed: state.customGpsRouteClosed,
+      rideMode: 'freeride',
+      workoutDurationSec: 0,
+    });
     set({
       rideMode: 'freeride',
+      activeGpsRoute,
+      visitedSceneries: [state.sceneryTheme],
+      sceneryCycleElapsedSec: 0,
       freeRideZone: initialZone,
       freeRideOffsetWatts: 0,
       freeRideTerrain: terrain,
@@ -890,15 +1132,30 @@ export const useAppStore = create<AppState>((set, get) => ({
     const currentState = get();
     const isFreeRide = currentState.rideMode === 'freeride';
     const zoneInfo = COGGAN_ZONES[currentState.freeRideZone];
+    const isNewSession = rideRecorder.getStartTimeMs() === null;
+    const visitedSceneries = isNewSession
+      ? [currentState.sceneryTheme]
+      : currentState.visitedSceneries;
+    const activityMeta = buildCurrentActivityMeta({
+      rideMode: currentState.rideMode,
+      activeWorkout: currentState.activeWorkout,
+      sceneryTheme: currentState.sceneryTheme,
+      visitedSceneries,
+    });
     rideRecorder.beginSession(
       isFreeRide ? 'freeride-session' : currentState.activeWorkout.id,
-      isFreeRide ? 'Free Ride · Undulating Terrain' : currentState.activeWorkout.name,
+      isFreeRide ? 'Free Ride' : currentState.activeWorkout.name,
       currentState.ftp,
       nowMs,
       isFreeRide ? currentState.freeRideZone : snap?.stepIndex ?? 0,
       isFreeRide
         ? `Free Ride · ${zoneInfo.code} ${zoneInfo.name}`
-        : snap?.step.label ?? 'Warmup'
+        : snap?.step.label ?? 'Warmup',
+      {
+        activityName: activityMeta.activityName,
+        sceneryName: activityMeta.sceneryName,
+        gpsRoute: currentState.activeGpsRoute,
+      }
     );
 
     const ergTarget = isFreeRide
@@ -907,8 +1164,11 @@ export const useAppStore = create<AppState>((set, get) => ({
 
     set({
       runState: 'running',
+      musicTestZone: null,
       autoPaused: false,
       zeroPedalSec: 0,
+      visitedSceneries,
+      ...(isNewSession ? { sceneryCycleElapsedSec: 0 } : {}),
       elapsedSec: workoutEngine.getElapsedSec(),
       activeSnapshot: snap,
       rideStartTimeMs: rideRecorder.getStartTimeMs(),
@@ -1017,15 +1277,26 @@ export const useAppStore = create<AppState>((set, get) => ({
       const nowMs = Date.now();
       const isFreeRide = state.rideMode === 'freeride';
       const zoneInfo = COGGAN_ZONES[state.freeRideZone];
+      const activityMeta = buildCurrentActivityMeta({
+        rideMode: state.rideMode,
+        activeWorkout: state.activeWorkout,
+        sceneryTheme: state.sceneryTheme,
+        visitedSceneries: [state.sceneryTheme],
+      });
       rideRecorder.beginSession(
         isFreeRide ? 'freeride-session' : state.activeWorkout.id,
-        isFreeRide ? 'Free Ride · Undulating Terrain' : state.activeWorkout.name,
+        isFreeRide ? 'Free Ride' : state.activeWorkout.name,
         state.ftp,
         nowMs,
         isFreeRide ? state.freeRideZone : state.activeSnapshot?.stepIndex ?? 0,
         isFreeRide
           ? `Free Ride · ${zoneInfo.code} ${zoneInfo.name}`
-          : state.activeSnapshot?.step.label ?? 'Warmup'
+          : state.activeSnapshot?.step.label ?? 'Warmup',
+        {
+          activityName: activityMeta.activityName,
+          sceneryName: activityMeta.sceneryName,
+          gpsRoute: state.activeGpsRoute,
+        }
       );
     }
     finalizeAndPersistCurrentRide(Date.now());
@@ -1125,7 +1396,96 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   setSceneryTheme: (sceneryTheme) => {
-    set({ sceneryTheme });
+    const state = get();
+    const isActiveRide = rideRecorder.getStartTimeMs() !== null && state.runState !== 'completed';
+    const nextVisited = isActiveRide
+      ? state.visitedSceneries.includes(sceneryTheme)
+        ? state.visitedSceneries
+        : [...state.visitedSceneries, sceneryTheme]
+      : [sceneryTheme];
+    if (isActiveRide) {
+      const meta = buildCurrentActivityMeta({
+        rideMode: state.rideMode,
+        activeWorkout: state.activeWorkout,
+        sceneryTheme,
+        visitedSceneries: nextVisited,
+      });
+      rideRecorder.updateMeta(state.ftp, meta.activityName, meta.sceneryName);
+    }
+    set({
+      sceneryTheme,
+      visitedSceneries: nextVisited,
+      sceneryCycleElapsedSec: 0,
+    });
+    persistFromStore();
+  },
+
+  setSceneryCycleMinutes: (sceneryCycleMinutes) => {
+    set({ sceneryCycleMinutes, sceneryCycleElapsedSec: 0 });
+    persistFromStore();
+  },
+
+  cycleNextScenery: () => {
+    const state = get();
+    const idx = SCENERY_CYCLE_ORDER.indexOf(state.sceneryTheme);
+    const next = SCENERY_CYCLE_ORDER[(idx + 1) % SCENERY_CYCLE_ORDER.length];
+    state.setSceneryTheme(next);
+  },
+
+  setGpsRoutePreset: (gpsRoutePreset) => {
+    const state = get();
+    const activeGpsRoute = compileActiveRouteFromConfig({
+      gpsRoutePreset,
+      gpsRouteTargetKm: state.gpsRouteTargetKm,
+      customGpsRouteName: state.customGpsRouteName,
+      customGpsRoutePoints: state.customGpsRoutePoints,
+      customGpsRouteClosed: state.customGpsRouteClosed,
+      rideMode: state.rideMode,
+      workoutDurationSec: state.activeWorkout.totalDuration,
+    });
+    rideRecorder.setGpsRoute(activeGpsRoute);
+    set({ gpsRoutePreset, activeGpsRoute });
+    persistFromStore();
+  },
+
+  setGpsRouteTargetKm: (km) => {
+    const clampedKm = Math.max(0, Math.min(120, Math.round(km)));
+    const state = get();
+    const activeGpsRoute = compileActiveRouteFromConfig({
+      gpsRoutePreset: state.gpsRoutePreset,
+      gpsRouteTargetKm: clampedKm,
+      customGpsRouteName: state.customGpsRouteName,
+      customGpsRoutePoints: state.customGpsRoutePoints,
+      customGpsRouteClosed: state.customGpsRouteClosed,
+      rideMode: state.rideMode,
+      workoutDurationSec: state.activeWorkout.totalDuration,
+    });
+    rideRecorder.setGpsRoute(activeGpsRoute);
+    set({ gpsRouteTargetKm: clampedKm, activeGpsRoute });
+    persistFromStore();
+  },
+
+  setCustomGpsRoute: (name, points, closedLoop) => {
+    const state = get();
+    const cleanName = (name || 'Custom Line Drawing').trim().slice(0, 64);
+    const cleanPoints = points.slice(0, 600);
+    const activeGpsRoute = compileActiveRouteFromConfig({
+      gpsRoutePreset: 'custom-drawing',
+      gpsRouteTargetKm: state.gpsRouteTargetKm,
+      customGpsRouteName: cleanName,
+      customGpsRoutePoints: cleanPoints,
+      customGpsRouteClosed: closedLoop,
+      rideMode: state.rideMode,
+      workoutDurationSec: state.activeWorkout.totalDuration,
+    });
+    rideRecorder.setGpsRoute(activeGpsRoute);
+    set({
+      gpsRoutePreset: 'custom-drawing',
+      customGpsRouteName: cleanName,
+      customGpsRoutePoints: cleanPoints,
+      customGpsRouteClosed: closedLoop,
+      activeGpsRoute,
+    });
     persistFromStore();
   },
 
@@ -1193,6 +1553,15 @@ export const useAppStore = create<AppState>((set, get) => ({
   setAudioRideVolume: (volume) => {
     set({ audioRideVolume: clampAudioVolume(volume, DEFAULT_AUDIO_RIDE_VOLUME) });
     persistFromStore();
+  },
+
+  setMusicFollowMode: (musicFollowMode) => {
+    set({ musicFollowMode });
+    persistFromStore();
+  },
+
+  setMusicTestZone: (musicTestZone) => {
+    set({ musicTestZone });
   },
 
   setFps: (fps) => set({ fps }),
@@ -1307,6 +1676,27 @@ export const useAppStore = create<AppState>((set, get) => ({
       savedRides: state.savedRides.filter((r) => r.id !== rideId),
       lastCompletedRide:
         state.lastCompletedRide?.id === rideId ? null : state.lastCompletedRide,
+    }));
+  },
+
+  markRideUploadedToStrava: async (rideId: string, stravaActivityId = null) => {
+    const nowMs = Date.now();
+    const state = get();
+    const targetRide =
+      state.savedRides.find((r) => r.id === rideId) ??
+      (state.lastCompletedRide?.id === rideId ? state.lastCompletedRide : null);
+    if (!targetRide) return;
+
+    const updated: SavedRide = {
+      ...targetRide,
+      uploadedToStrava: true,
+      uploadedAtMs: nowMs,
+      stravaActivityId,
+    };
+    await saveCompletedRide(updated);
+    set((cur) => ({
+      savedRides: cur.savedRides.map((r) => (r.id === rideId ? updated : r)),
+      lastCompletedRide: cur.lastCompletedRide?.id === rideId ? updated : cur.lastCompletedRide,
     }));
   },
 }));

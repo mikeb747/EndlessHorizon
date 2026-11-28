@@ -4,7 +4,10 @@ import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { Bloom, ChromaticAberration, EffectComposer } from '@react-three/postprocessing';
 import { BlendFunction } from 'postprocessing';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
+import { GpsRoutePreviewSvg } from '../components/GpsRoutePreviewSvg';
 import { sampleFreeRideGrade } from '../core/freeRide';
+import { sampleCompiledRouteProgress } from '../recording/gpsRoutes';
+import { getSceneryDisplayName } from '../recording/types';
 import {
   getActiveZone,
   QualityLevel,
@@ -20,12 +23,15 @@ import { NeonCyclist } from './NeonCyclist';
 import { NeonRoad } from './NeonRoad';
 import {
   buildWorkoutElevationProfile,
+  computeCornerLeanAngle,
   createWorldRuntime,
   getRoadCurvatureAt,
   getZoneGradient,
   REF_ROAD_SPEED_MPS,
   ROAD_Z_SPAN,
   sampleGradeAtTime,
+  setActiveRoadCurveSource,
+  updateRoadCurveLut,
   WORLD_CAMERA_FAR,
   WORLD_CAMERA_NEAR,
   WorkoutElevationProfile,
@@ -81,6 +87,122 @@ const THEME_PALETTE: Record<
 
 const _aberrationVec = new THREE.Vector2(0, 0);
 const _projScreenMatrix = new THREE.Matrix4();
+const _targetBgColor = new THREE.Color();
+const _targetFogColor = new THREE.Color();
+const _targetKeyColor = new THREE.Color();
+const _targetSkyColor = new THREE.Color();
+const _targetGroundColor = new THREE.Color();
+
+/**
+ * Seamless horizon-mist crossfade rig for mid-ride scenery switching:
+ * - Swells exponential fog into a luminous twilight veil (~0.8s)
+ * - Swaps renderedTheme cleanly at peak veil (zero double-rendering cost, zero pop-in)
+ * - Clears smoothly into the new world's sky, lighting, and fog palette (~1.0s)
+ */
+function SceneryTransitionRig({
+  targetTheme,
+  renderedTheme,
+  onSwapTheme,
+  instant,
+}: {
+  targetTheme: SceneryTheme;
+  renderedTheme: SceneryTheme;
+  onSwapTheme: (next: SceneryTheme) => void;
+  instant: boolean;
+}) {
+  const scene = useThree((s) => s.scene);
+  const fogRef = useRef<THREE.FogExp2>(null);
+  const hemiRef = useRef<THREE.HemisphereLight>(null);
+  const keyRef = useRef<THREE.DirectionalLight>(null);
+
+  const phaseRef = useRef<'idle' | 'in' | 'out'>('idle');
+  const progressRef = useRef(0);
+  const pendingThemeRef = useRef<SceneryTheme>(targetTheme);
+  const initialPalette = THEME_PALETTE[renderedTheme];
+
+  useEffect(() => {
+    if (targetTheme === renderedTheme) return;
+    if (instant) {
+      pendingThemeRef.current = targetTheme;
+      phaseRef.current = 'idle';
+      progressRef.current = 0;
+      onSwapTheme(targetTheme);
+      return;
+    }
+    pendingThemeRef.current = targetTheme;
+    phaseRef.current = 'in';
+    progressRef.current = 0;
+  }, [targetTheme, renderedTheme, instant, onSwapTheme]);
+
+  useFrame((_, delta) => {
+    const dt = Math.min(0.1, delta);
+    const activePal = THEME_PALETTE[renderedTheme];
+    const destPal = THEME_PALETTE[pendingThemeRef.current];
+
+    let targetDensity = activePal.fogDensity;
+
+    if (phaseRef.current === 'in') {
+      progressRef.current = Math.min(1, progressRef.current + dt / 0.8);
+      const easeIn = progressRef.current * progressRef.current;
+      targetDensity = activePal.fogDensity + (0.0175 - activePal.fogDensity) * easeIn;
+      if (progressRef.current >= 1) {
+        phaseRef.current = 'out';
+        progressRef.current = 0;
+        onSwapTheme(pendingThemeRef.current);
+      }
+    } else if (phaseRef.current === 'out') {
+      progressRef.current = Math.min(1, progressRef.current + dt / 1.05);
+      const easeOut = 1 - Math.pow(1 - progressRef.current, 2);
+      targetDensity = 0.0175 + (activePal.fogDensity - 0.0175) * easeOut;
+      if (progressRef.current >= 1) {
+        phaseRef.current = 'idle';
+        progressRef.current = 0;
+      }
+    }
+
+    const colorPal = phaseRef.current === 'in' ? destPal : activePal;
+    const damp = 1 - Math.exp(-3.8 * dt);
+
+    _targetBgColor.set(colorPal.bg);
+    _targetFogColor.set(colorPal.fog);
+    _targetKeyColor.set(colorPal.key);
+    _targetSkyColor.set(colorPal.fillSky);
+    _targetGroundColor.set(colorPal.fillGround);
+
+    if (scene.background instanceof THREE.Color) {
+      scene.background.lerp(_targetBgColor, damp);
+    }
+    if (fogRef.current) {
+      fogRef.current.color.lerp(_targetFogColor, damp);
+      fogRef.current.density += (targetDensity - fogRef.current.density) * (1 - Math.exp(-9 * dt));
+    }
+    if (keyRef.current) {
+      keyRef.current.color.lerp(_targetKeyColor, damp);
+    }
+    if (hemiRef.current) {
+      hemiRef.current.color.lerp(_targetSkyColor, damp);
+      hemiRef.current.groundColor.lerp(_targetGroundColor, damp);
+    }
+  });
+
+  return (
+    <>
+      <color attach="background" args={[initialPalette.bg]} />
+      <fogExp2 ref={fogRef} attach="fog" args={[initialPalette.fog, initialPalette.fogDensity]} />
+      <hemisphereLight
+        ref={hemiRef}
+        args={[initialPalette.fillSky, initialPalette.fillGround, 1.15]}
+      />
+      <directionalLight
+        ref={keyRef}
+        position={[12, 22, 16]}
+        intensity={1.55}
+        color={initialPalette.key}
+      />
+      <directionalLight position={[-10, 8, -18]} intensity={1.1} color="#00f0ff" />
+    </>
+  );
+}
 
 function StudioEnvironment() {
   const gl = useThree((s) => s.gl);
@@ -126,6 +248,12 @@ function SceneDriver({
   const fpsCounterRef = useRef({ frames: 0, elapsed: 0 });
   const domSyncAccumRef = useRef(0);
 
+  useEffect(() => {
+    return () => {
+      setActiveRoadCurveSource(null);
+    };
+  }, []);
+
   useFrame((_, delta) => {
     const dt = Math.min(0.1, delta);
     const state = useAppStore.getState();
@@ -136,6 +264,7 @@ function SceneDriver({
     rt.freeRideTerrain = isFreeRide ? state.freeRideTerrain : null;
     rt.elevationProfile = demoMode || isFreeRide ? null : elevationProfile;
     rt.workoutDurationSec = state.activeWorkout.totalDuration;
+    rt.gpsRoute = demoMode ? null : state.activeGpsRoute;
 
     // Smoothly advance workoutElapsedSec between 1 Hz engine ticks with zero lag at any FPS
     if (!demoMode) {
@@ -258,9 +387,15 @@ function SceneDriver({
     rt.currentGrade += (targetGrade - rt.currentGrade) * (1 - Math.exp(-4.5 * dt));
     rt.pitchAngle = Math.atan(rt.currentGrade);
 
-    // Smooth banking lean into upcoming road curves
-    const targetLean =
-      rt.speedMps > 0.5 ? THREE.MathUtils.clamp(getRoadCurvatureAt(rt.distance), -0.22, 0.22) : 0;
+    // Update GPS Art road curve LUT once per frame so road, sidewalks, props & finish sign curve identically
+    updateRoadCurveLut(rt);
+    setActiveRoadCurveSource(rt.curveLutReady ? rt : null);
+
+    // Smooth banking lean INTO upcoming road curves (right turn -> tilts right, left turn -> tilts left)
+    const activeCurvature = rt.curveLutReady
+      ? rt.currentCurvature
+      : getRoadCurvatureAt(rt.distance);
+    const targetLean = computeCornerLeanAngle(activeCurvature, rt.curveLutReady, rt.speedMps);
     rt.leanAngle += (targetLean - rt.leanAngle) * (1 - Math.exp(-4.0 * dt));
 
     // Bounded adaptive forward FOV (46°..66°) limits peripheral overdraw while preserving road framing
@@ -372,18 +507,37 @@ export function NeonWorldCanvas({ demoMode = false }: NeonWorldCanvasProps) {
   const freeRideGrade = useAppStore((s) => s.freeRideGrade);
   const freeRideTargetWatts = useAppStore((s) => s.freeRideTargetWatts);
   const autoPaused = useAppStore((s) => s.autoPaused);
+  const activeGpsRoute = useAppStore((s) => s.activeGpsRoute);
+  const rideDistanceM = useAppStore((s) => s.rideDistanceM);
   const zone = useAppStore(getActiveZone);
 
   const [contextLost, setContextLost] = useState(false);
+  const [renderedTheme, setRenderedTheme] = useState<SceneryTheme>(sceneryTheme);
+  const [transitionBanner, setTransitionBanner] = useState<string | null>(null);
+  const prevThemeRef = useRef<SceneryTheme>(sceneryTheme);
   const softwareGl = useMemo(() => isSoftwareWebGl(), []);
   const runtimeRef = useRef<WorldRuntimeState>(createWorldRuntime());
   const viewportRef = useRef<HTMLDivElement>(null);
   const elevationProfile = useMemo(
-    () => (demoMode ? null : buildWorkoutElevationProfile(activeWorkout)),
-    [activeWorkout, demoMode]
+    () => (demoMode ? null : buildWorkoutElevationProfile(activeWorkout, sceneryTheme)),
+    [activeWorkout, demoMode, sceneryTheme]
   );
 
-  const palette = THEME_PALETTE[sceneryTheme];
+  // Show a brief non-blocking horizon banner when scenery transitions mid-ride
+  useEffect(() => {
+    if (prevThemeRef.current === sceneryTheme) return;
+    prevThemeRef.current = sceneryTheme;
+    if (demoMode) return;
+    setTransitionBanner(getSceneryDisplayName(sceneryTheme));
+    const timer = window.setTimeout(() => setTransitionBanner(null), 3400);
+    return () => window.clearTimeout(timer);
+  }, [sceneryTheme, demoMode]);
+
+  const gpsProgress01 = useMemo(
+    () => sampleCompiledRouteProgress(activeGpsRoute, rideDistanceM),
+    [activeGpsRoute, rideDistanceM]
+  );
+
   const ftpPct = ftp > 0 ? Math.round((power3sAvg / ftp) * 100) : 0;
   const targetWatts =
     rideMode === 'freeride'
@@ -397,7 +551,7 @@ export function NeonWorldCanvas({ demoMode = false }: NeonWorldCanvasProps) {
   const gradePct =
     rideMode === 'freeride'
       ? Math.round(freeRideGrade * 1000) / 10
-      : Math.round(getZoneGradient(zone.zone) * 100);
+      : Math.round(getZoneGradient(zone.zone, sceneryTheme) * 100);
   const gradeLabel =
     Math.abs(gradePct) < 0.2
       ? 'FLAT 0%'
@@ -414,6 +568,8 @@ export function NeonWorldCanvas({ demoMode = false }: NeonWorldCanvasProps) {
       className="relative w-full h-full overflow-hidden bg-[#070414]"
       data-testid="neon-world-viewport"
       data-theme={sceneryTheme}
+      data-rendered-theme={renderedTheme}
+      data-gps-route={activeGpsRoute?.id ?? 'urashima-loop'}
       data-zone={zone.code}
       data-speed-streaks={zone.zone >= 3 && quality !== 'low' ? 'active' : 'hidden'}
       data-cadence-matching={cadenceMatchingEnabled ? 'on' : 'off'}
@@ -457,13 +613,14 @@ export function NeonWorldCanvas({ demoMode = false }: NeonWorldCanvasProps) {
             canvas.addEventListener('webglcontextrestored', handleRestored, false);
           }}
         >
-          <color attach="background" args={[palette.bg]} />
-          <fogExp2 attach="fog" args={[palette.fog, palette.fogDensity]} />
+          <SceneryTransitionRig
+            targetTheme={sceneryTheme}
+            renderedTheme={renderedTheme}
+            onSwapTheme={setRenderedTheme}
+            instant={demoMode || softwareGl}
+          />
 
           <StudioEnvironment />
-          <hemisphereLight args={[palette.fillSky, palette.fillGround, 1.15]} />
-          <directionalLight position={[12, 22, 16]} intensity={1.55} color={palette.key} />
-          <directionalLight position={[-10, 8, -18]} intensity={1.1} color="#00f0ff" />
 
           <SceneDriver
             runtimeRef={runtimeRef}
@@ -477,13 +634,13 @@ export function NeonWorldCanvas({ demoMode = false }: NeonWorldCanvasProps) {
 
           <SceneryThemes
             runtimeRef={runtimeRef}
-            sceneryTheme={sceneryTheme}
+            sceneryTheme={renderedTheme}
             quality={quality}
           />
           <NeonRoad
             runtimeRef={runtimeRef}
             zoneHex={zone.hex}
-            sceneryTheme={sceneryTheme}
+            sceneryTheme={renderedTheme}
             quality={quality}
           />
           {!demoMode && rideMode === 'workout' && (
@@ -569,6 +726,37 @@ export function NeonWorldCanvas({ demoMode = false }: NeonWorldCanvasProps) {
                   </div>
                 )}
               </div>
+            </div>
+          )}
+
+          {transitionBanner && (
+            <div
+              className="pointer-events-none absolute inset-x-0 top-12 flex justify-center z-20"
+              data-testid="scenery-transition-banner"
+            >
+              <div className="px-4 py-1.5 rounded-md border border-pink-400/75 bg-[#09051c]/90 text-xs font-display font-bold tracking-[0.18em] text-pink-200 uppercase shadow-[0_0_18px_rgba(255,42,157,0.35)]">
+                Entering {transitionBanner}
+              </div>
+            </div>
+          )}
+
+          {activeGpsRoute && (
+            <div
+              className="pointer-events-none absolute bottom-3 right-3 z-10 w-44 sm:w-52 rounded-lg border border-cyan-500/45 bg-[#08061a]/88 p-2 shadow-[0_0_16px_rgba(0,240,255,0.2)]"
+              data-testid="gps-route-minimap"
+            >
+              <div className="flex items-center justify-between text-[10px] font-display uppercase tracking-wider text-cyan-200 px-0.5 mb-1">
+                <span className="truncate">{activeGpsRoute.name}</span>
+                <span className="tabular-nums text-pink-300 shrink-0 ml-1">
+                  {Math.round(gpsProgress01 * 100)}%
+                </span>
+              </div>
+              <GpsRoutePreviewSvg
+                points={activeGpsRoute.previewPoints}
+                progress01={gpsProgress01}
+                height={62}
+                label={`${activeGpsRoute.name} live GPS map`}
+              />
             </div>
           )}
 

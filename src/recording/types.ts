@@ -56,10 +56,59 @@ export interface RecordedLap {
   calories: number;
 }
 
+export type SceneryDisplayId =
+  | 'neon-city'
+  | 'palm-grove'
+  | 'cloud-horizon'
+  | 'causeway-embankment';
+
+export function getSceneryDisplayName(theme: SceneryDisplayId): string {
+  switch (theme) {
+    case 'neon-city':
+      return 'Neon City';
+    case 'palm-grove':
+      return 'Palm Grove';
+    case 'cloud-horizon':
+      return 'Cloud Horizon';
+    case 'causeway-embankment':
+      return 'Island Causeway';
+  }
+}
+
+/**
+ * Format the Garmin .FIT Activity Name per user specification:
+ * - Free Ride: "Free Ride - <Scenery>"
+ * - Workout:   "<Workout Name> - <Scenery>"
+ */
+export function formatFitActivityName(opts: {
+  rideMode: 'workout' | 'freeride';
+  workoutName: string;
+  sceneryTheme: SceneryDisplayId;
+  visitedSceneries?: readonly SceneryDisplayId[];
+}): string {
+  const unique = opts.visitedSceneries
+    ? Array.from(new Set(opts.visitedSceneries))
+    : [opts.sceneryTheme];
+  const sceneryLabel =
+    unique.length > 1
+      ? `${getSceneryDisplayName(unique[0])} + ${unique.length - 1} Worlds`
+      : getSceneryDisplayName(unique[0] ?? opts.sceneryTheme);
+
+  if (opts.rideMode === 'freeride') {
+    return `Free Ride - ${sceneryLabel}`;
+  }
+  const cleanWorkout = (opts.workoutName || 'Workout').trim();
+  return `${cleanWorkout} - ${sceneryLabel}`;
+}
+
 export interface SavedRide {
   id: string;
   workoutId: string;
   workoutName: string;
+  /** Exact activity name embedded in the binary .FIT file ("Free Ride - Scenery" or "Workout Name - Scenery") */
+  activityName?: string;
+  sceneryName?: string;
+  gpsRouteName?: string;
   ftp: number;
   startTimeMs: number;
   endTimeMs: number;
@@ -85,6 +134,7 @@ export interface SavedRide {
   subSport: typeof FIT_SUB_SPORT_VIRTUAL_ACTIVITY;
   uploadedToStrava: boolean;
   uploadedAtMs?: number;
+  stravaActivityId?: number | null;
   records: RecordedSample[];
   laps: RecordedLap[];
 }

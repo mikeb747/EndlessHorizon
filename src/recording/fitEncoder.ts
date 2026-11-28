@@ -27,11 +27,17 @@ const SEMICIRCLES_PER_DEGREE = 2147483648 / 180; // 2^31 / 180
 // Standard FIT base type IDs (little-endian architecture = 0)
 const BASE_ENUM = 0x00;
 const BASE_UINT8 = 0x02;
+const BASE_STRING = 0x07;
 const BASE_SINT16 = 0x83;
 const BASE_UINT16 = 0x84;
 const BASE_SINT32 = 0x85;
 const BASE_UINT32 = 0x86;
 const BASE_UINT32Z = 0x8c;
+
+const PRODUCT_NAME_BYTES = 32;
+const ACTIVITY_NAME_BYTES = 64;
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
 
 // Invalid sentinels
 const INVALID_UINT8 = 0xff;
@@ -129,6 +135,18 @@ class BinaryWriter {
     this.offset += 4;
   }
 
+  /**
+   * Write a fixed-size UTF-8 null-terminated FIT string field (zero-padded to byteSize).
+   */
+  writeFixedString(value: string, byteSize: number): void {
+    this.ensureCapacity(byteSize);
+    const encoded = textEncoder.encode(value);
+    const copyLen = Math.min(encoded.length, Math.max(0, byteSize - 1));
+    this.buffer.fill(0, this.offset, this.offset + byteSize);
+    this.buffer.set(encoded.subarray(0, copyLen), this.offset);
+    this.offset += byteSize;
+  }
+
   writeDefinition(localMesgNum: number, globalMesgNum: number, fields: FieldDef[]): void {
     // Definition message header: bit 6 set (0x40) + local message number (0..15)
     this.writeUint8(0x40 | (localMesgNum & 0x0f));
@@ -201,11 +219,27 @@ const FILE_ID_FIELDS: FieldDef[] = [
   { num: 2, size: 2, baseType: BASE_UINT16 }, // product
   { num: 3, size: 4, baseType: BASE_UINT32Z }, // serial_number
   { num: 4, size: 4, baseType: BASE_UINT32 }, // time_created
+  { num: 8, size: PRODUCT_NAME_BYTES, baseType: BASE_STRING }, // product_name
 ];
 
 const FILE_CREATOR_FIELDS: FieldDef[] = [
   { num: 0, size: 2, baseType: BASE_UINT16 }, // software_version
   { num: 1, size: 1, baseType: BASE_UINT8 }, // hardware_version
+];
+
+// Global 12 (sport): carries the Activity / Sport Profile Name read by Strava & Garmin Connect
+const SPORT_FIELDS: FieldDef[] = [
+  { num: 0, size: 1, baseType: BASE_ENUM }, // sport = 2 (cycling)
+  { num: 1, size: 1, baseType: BASE_ENUM }, // sub_sport = 58 (virtual_activity)
+  { num: 3, size: ACTIVITY_NAME_BYTES, baseType: BASE_STRING }, // name (Activity Name)
+];
+
+// Global 26 (workout): carries wkt_name for Strava & training platforms
+const WORKOUT_FIELDS: FieldDef[] = [
+  { num: 4, size: 1, baseType: BASE_ENUM }, // sport = 2 (cycling)
+  { num: 6, size: 2, baseType: BASE_UINT16 }, // num_valid_steps
+  { num: 8, size: ACTIVITY_NAME_BYTES, baseType: BASE_STRING }, // wkt_name (Activity Name)
+  { num: 11, size: 1, baseType: BASE_ENUM }, // sub_sport = 58 (virtual_activity)
 ];
 
 const DEVICE_INFO_FIELDS: FieldDef[] = [
@@ -347,16 +381,18 @@ function writeLapMessage(writer: BinaryWriter, lap: RecordedLap): void {
 export function encodeRideToFit(ride: SavedRide): Uint8Array {
   const startTs = toFitTimestamp(ride.startTimeMs);
   const endTs = Math.max(startTs, toFitTimestamp(ride.endTimeMs));
-  const writer = new BinaryWriter(Math.max(8192, ride.records.length * 40 + 2048));
+  const activityName = (ride.activityName || ride.workoutName || 'Endless Horizon Cycling').trim();
+  const writer = new BinaryWriter(Math.max(8192, ride.records.length * 40 + 2560));
 
   // Local 0 -> file_id (global 0)
   writer.writeDefinition(0, 0, FILE_ID_FIELDS);
   writer.writeDataHeader(0);
   writer.writeUint8(4); // file_type = activity
   writer.writeUint16(255); // manufacturer = development
-  writer.writeUint16(1); // product = NeonVelo Virtual Trainer
+  writer.writeUint16(1); // product = Endless Horizon Cycling
   writer.writeUint32(19840001); // serial_number
   writer.writeUint32(startTs);
+  writer.writeFixedString('Endless Horizon Cycling', PRODUCT_NAME_BYTES);
 
   // Local 1 -> file_creator (global 49)
   writer.writeDefinition(1, 49, FILE_CREATOR_FIELDS);
@@ -372,6 +408,21 @@ export function encodeRideToFit(ride: SavedRide): Uint8Array {
   writer.writeUint16(255); // development
   writer.writeUint16(1);
   writer.writeUint16(100);
+
+  // Local 8 -> sport (global 12): sets Activity Name ("Free Ride - Scenery" / "Workout - Scenery")
+  writer.writeDefinition(8, 12, SPORT_FIELDS);
+  writer.writeDataHeader(8);
+  writer.writeUint8(FIT_SPORT_CYCLING);
+  writer.writeUint8(FIT_SUB_SPORT_VIRTUAL_ACTIVITY);
+  writer.writeFixedString(activityName, ACTIVITY_NAME_BYTES);
+
+  // Local 9 -> workout (global 26): sets wkt_name for platforms reading workout title
+  writer.writeDefinition(9, 26, WORKOUT_FIELDS);
+  writer.writeDataHeader(9);
+  writer.writeUint8(FIT_SPORT_CYCLING);
+  writer.writeUint16(Math.max(1, ride.laps.length));
+  writer.writeFixedString(activityName, ACTIVITY_NAME_BYTES);
+  writer.writeUint8(FIT_SUB_SPORT_VIRTUAL_ACTIVITY);
 
   // Local 3 -> event (global 21): Timer Start
   writer.writeDefinition(3, 21, EVENT_FIELDS);
@@ -486,6 +537,8 @@ export interface FitVerificationSummary {
   messageCountsByGlobalNum: Record<number, number>;
   sessionSport: number | null;
   sessionSubSport: number | null;
+  sportActivityName: string | null;
+  workoutActivityName: string | null;
   lapSports: number[];
   lapSubSports: number[];
   firstRecordLatDeg: number | null;
@@ -494,10 +547,17 @@ export interface FitVerificationSummary {
   lastRecordAltitudeM: number | null;
 }
 
+function readNullTerminatedString(bytes: Uint8Array, start: number, maxLen: number): string {
+  let end = start;
+  const limit = Math.min(bytes.length, start + maxLen);
+  while (end < limit && bytes[end] !== 0) end++;
+  return textDecoder.decode(bytes.subarray(start, end));
+}
+
 /**
  * Lightweight FIT binary parser/validator used by automated unit tests to verify
  * header signature, CRC-16 integrity, message counts, sport/sub_sport enums,
- * Ura-shima GPS coordinates, and virtual altitude encoding.
+ * Activity Name strings, Ura-shima GPS coordinates, and virtual altitude encoding.
  */
 export function verifyFitBinary(bytes: Uint8Array): FitVerificationSummary {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -513,6 +573,8 @@ export function verifyFitBinary(bytes: Uint8Array): FitVerificationSummary {
   const counts: Record<number, number> = {};
   let sessionSport: number | null = null;
   let sessionSubSport: number | null = null;
+  let sportActivityName: string | null = null;
+  let workoutActivityName: string | null = null;
   const lapSports: number[] = [];
   const lapSubSports: number[] = [];
   let firstRecordLatDeg: number | null = null;
@@ -550,7 +612,11 @@ export function verifyFitBinary(bytes: Uint8Array): FitVerificationSummary {
 
       const isFirstRecord = def.globalNum === 20 && !firstRecordSeen;
       for (const f of def.fields) {
-        if (def.globalNum === 18) {
+        if (def.globalNum === 12) {
+          if (f.num === 3) sportActivityName = readNullTerminatedString(bytes, pos, f.size);
+        } else if (def.globalNum === 26) {
+          if (f.num === 8) workoutActivityName = readNullTerminatedString(bytes, pos, f.size);
+        } else if (def.globalNum === 18) {
           if (f.num === 5) sessionSport = view.getUint8(pos);
           if (f.num === 6) sessionSubSport = view.getUint8(pos);
         } else if (def.globalNum === 19) {
@@ -583,6 +649,8 @@ export function verifyFitBinary(bytes: Uint8Array): FitVerificationSummary {
     messageCountsByGlobalNum: counts,
     sessionSport,
     sessionSubSport,
+    sportActivityName,
+    workoutActivityName,
     lapSports,
     lapSubSports,
     firstRecordLatDeg,
@@ -592,15 +660,18 @@ export function verifyFitBinary(bytes: Uint8Array): FitVerificationSummary {
   };
 }
 
-export function buildFitFileName(ride: Pick<SavedRide, 'workoutName' | 'startTimeMs'>): string {
+export function buildFitFileName(
+  ride: Pick<SavedRide, 'workoutName' | 'activityName' | 'startTimeMs'>
+): string {
   const d = new Date(ride.startTimeMs);
   const pad = (n: number) => String(n).padStart(2, '0');
   const stamp = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(
     d.getHours()
   )}-${pad(d.getMinutes())}`;
-  const slug = ride.workoutName
+  const label = ride.activityName || ride.workoutName || 'Ride';
+  const slug = label
     .replace(/[^a-zA-Z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '')
-    .slice(0, 36);
-  return `NeonVelo_${slug || 'Ride'}_${stamp}.fit`;
+    .slice(0, 48);
+  return `EndlessHorizon_${slug || 'Ride'}_${stamp}.fit`;
 }

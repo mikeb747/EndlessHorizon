@@ -22,11 +22,14 @@ import {
   CLOUD_HORIZON_BUSH_SPACING_M,
   CLOUD_HORIZON_SPRITE_COUNT,
   computeBuildingCenterOffset,
+  computeCornerLeanAngle,
   computeForwardScrollOffset,
   computeLinearRoadT,
   computeRoadSegmentZ,
   computeSpeedStreakParams,
+  createWorldRuntime,
   getZoneGradient,
+  MAX_VISIBLE_HEADING_RAD,
   NEON_CITY_BUILDING_MAX_JITTER,
   NEON_CITY_BUILDING_MAX_WIDTH,
   NEON_CITY_CURB_GAP,
@@ -44,6 +47,7 @@ import {
   sampleGradeAtTime,
   sampleRoadAtZ,
   SKY_DOME_RADIUS,
+  updateRoadCurveLut,
   WORLD_CAMERA_NEAR,
 } from '../world/roadMath';
 import type {
@@ -52,7 +56,20 @@ import type {
 } from '../workers/workoutEngine.worker';
 import { RideRecorder } from '../recording/rideRecorder';
 import { buildFitFileName, encodeRideToFit, verifyFitBinary } from '../recording/fitEncoder';
-import { FIT_SPORT_CYCLING, FIT_SUB_SPORT_VIRTUAL_ACTIVITY } from '../recording/types';
+import {
+  BIKE_LINE_ART_POINTS,
+  compileGpsRoute,
+  MAX_IN_GAME_CURVATURE,
+  sampleCompiledRouteCurvature,
+  sampleCompiledRouteGps,
+} from '../recording/gpsRoutes';
+import { traceLineDrawingRgba } from '../recording/lineArtTracer';
+import {
+  FIT_SPORT_CYCLING,
+  FIT_SUB_SPORT_VIRTUAL_ACTIVITY,
+  formatFitActivityName,
+  getSceneryDisplayName,
+} from '../recording/types';
 import { URASHIMA_CENTER_LAT, URASHIMA_CENTER_LON, VIRTUAL_START_ALTITUDE_M } from '../recording/virtualGps';
 import {
   createCrankRevState,
@@ -66,6 +83,17 @@ import {
   solveTwoBoneLegIK,
   stepCadenceMatcher,
 } from '../world/cadenceMatcher';
+import {
+  AM_CHORD_PROGRESSION_8BAR,
+  computeEffectiveMusicLayers,
+  computeFourBarRampSeconds,
+  createZoneHysteresisState,
+  evaluateIntervalAnticipation,
+  mapCogganToMusicZone,
+  resolveMusicCandidateZone,
+  stepZoneHysteresis,
+  ZONE_BPM,
+} from '../audio/musicEngineLogic';
 import {
   CAMERA_FOV_MAX,
   CAMERA_FOV_MIN,
@@ -290,35 +318,48 @@ test('WorkoutEngine manages nested timeline, FTP/intensity targets, and worker p
   assert.equal(terminated, true);
 });
 
-test('zone gradients and workout elevation profile map Z1..Z5+ to 0%, 2%, 4%, 8%, 20%', () => {
+test('zone gradients are steeper overall and +10% steeper for Zone 5+ on Neon City', () => {
   assert.equal(getZoneGradient(1), 0.0);
-  assert.equal(getZoneGradient(2), 0.02);
-  assert.equal(getZoneGradient(3), 0.04);
-  assert.equal(getZoneGradient(4), 0.08);
-  assert.equal(getZoneGradient(5), 0.2);
-  assert.equal(getZoneGradient(6), 0.2);
-  assert.equal(getZoneGradient(7), 0.2);
+  assert.equal(getZoneGradient(2), 0.03);
+  assert.equal(getZoneGradient(3), 0.06);
+  assert.equal(getZoneGradient(4), 0.1);
+  assert.equal(getZoneGradient(5, 'palm-grove'), 0.22);
+  assert.equal(getZoneGradient(6, 'cloud-horizon'), 0.22);
+  assert.equal(getZoneGradient(7, 'causeway-embankment'), 0.22);
+
+  // Neon City Zone 5+ is exactly +10% steeper (32% vs 22%)
+  assert.ok(Math.abs(getZoneGradient(5, 'neon-city') - getZoneGradient(5, 'palm-grove') - 0.1) < 1e-9);
+  assert.equal(getZoneGradient(5, 'neon-city'), 0.32);
+  assert.equal(getZoneGradient(6, 'neon-city'), 0.32);
+  assert.equal(getZoneGradient(7, 'neon-city'), 0.32);
 
   const workout = parseZwoWorkout(BUILT_IN_HIIT_ZWO, 'test-elev');
-  const profile = buildWorkoutElevationProfile(workout);
+  const profile = buildWorkoutElevationProfile(workout, 'palm-grove');
+  const neonProfile = buildWorkoutElevationProfile(workout, 'neon-city');
 
   // Start of Warmup (t=5s, Z1 Active Recovery) -> completely flat (0%)
   assert.equal(sampleGradeAtTime(profile, 5), 0);
-  // Mid Warmup (t=300s, 68% FTP = Z2 Endurance) -> 2%
-  assert.ok(Math.abs(sampleGradeAtTime(profile, 300) - 0.02) < 1e-5);
-  // Threshold Primer (t=660s, 92% FTP = Z4 Threshold) -> 8%
-  assert.ok(Math.abs(sampleGradeAtTime(profile, 660) - 0.08) < 1e-5);
-  // HIIT Block 1 Work (t=915s, 126% FTP = Z6 Anaerobic) -> 20%
-  assert.ok(Math.abs(sampleGradeAtTime(profile, 915) - 0.2) < 1e-5);
+  // Mid Warmup (t=300s, 68% FTP = Z2 Endurance) -> 3%
+  assert.ok(Math.abs(sampleGradeAtTime(profile, 300) - 0.03) < 1e-5);
+  // Threshold Primer (t=660s, 92% FTP = Z4 Threshold) -> 10%
+  assert.ok(Math.abs(sampleGradeAtTime(profile, 660) - 0.1) < 1e-5);
+  // HIIT Block 1 Work (t=915s, 126% FTP = Z6 Anaerobic) -> 22% (other worlds) vs 32% (Neon City)
+  assert.ok(Math.abs(sampleGradeAtTime(profile, 915) - 0.22) < 1e-5);
+  assert.ok(Math.abs(sampleGradeAtTime(neonProfile, 915) - 0.32) < 1e-5);
 
-  // Verify 50m ahead during steady 20% climb rises ~10m vertically
+  // Verify 50m ahead during steady 22% climb rises ~11m, and 32% Neon City climb rises ~16m
   const flatSample = sampleRoadAtZ(0, -50, { x: 0, y: 0, slopeX: 0, slopeY: 0 }, profile, 5);
   assert.ok(Math.abs(flatSample.y) < 0.01, `Expected flat road at Z1, got y=${flatSample.y}`);
 
   const climbSample = sampleRoadAtZ(0, -50, { x: 0, y: 0, slopeX: 0, slopeY: 0 }, profile, 910);
   assert.ok(
-    climbSample.y > 9.5 && climbSample.y < 10.5,
-    `Expected ~10m vertical rise over 50m on 20% Z6 climb, got y=${climbSample.y}`
+    climbSample.y > 10.5 && climbSample.y < 11.5,
+    `Expected ~11m vertical rise over 50m on 22% climb, got y=${climbSample.y}`
+  );
+  const neonClimbSample = sampleRoadAtZ(0, -50, { x: 0, y: 0, slopeX: 0, slopeY: 0 }, neonProfile, 910);
+  assert.ok(
+    neonClimbSample.y > 15.2 && neonClimbSample.y < 16.8,
+    `Expected ~16m vertical rise over 50m on 32% Neon City climb, got y=${neonClimbSample.y}`
   );
 });
 
@@ -421,7 +462,7 @@ test('RideRecorder tracks HR/Power/Cadence/Speed/Distance/Altitude and auto-spli
   );
 
   const fileName = buildFitFileName(ride);
-  assert.ok(fileName.startsWith('NeonVelo_HIIT30-15-Test_'));
+  assert.ok(fileName.startsWith('EndlessHorizon_HIIT30-15-Test_'));
   assert.ok(fileName.endsWith('.fit'));
 });
 
@@ -1039,6 +1080,293 @@ test('synthwave audio volume clamping, gain routing, pause ducking, and zone-ada
   ]);
   assert.equal(offsets.size, 4);
 });
+
+test('FIT Activity Name formats Free Ride and Workout with scenery and encodes into binary FIT sport & workout messages', () => {
+  assert.equal(
+    formatFitActivityName({
+      rideMode: 'freeride',
+      workoutName: 'Free Ride',
+      sceneryTheme: 'neon-city',
+    }),
+    'Free Ride - Neon City'
+  );
+  assert.equal(
+    formatFitActivityName({
+      rideMode: 'workout',
+      workoutName: 'Progressions',
+      sceneryTheme: 'palm-grove',
+    }),
+    'Progressions - Palm Grove'
+  );
+  assert.equal(
+    formatFitActivityName({
+      rideMode: 'freeride',
+      workoutName: 'Free Ride',
+      sceneryTheme: 'cloud-horizon',
+      visitedSceneries: ['neon-city', 'palm-grove', 'cloud-horizon'],
+    }),
+    'Free Ride - Neon City + 2 Worlds'
+  );
+  assert.equal(getSceneryDisplayName('causeway-embankment'), 'Island Causeway');
+
+  // Verify binary FIT embeds Activity Name cleanly into both sport (global 12) and workout (global 26)
+  const recorder = new RideRecorder();
+  const t0 = Date.UTC(2026, 10, 27, 20, 33, 0);
+  recorder.beginSession('freeride-session', 'Free Ride', 250, t0, 2, 'Free Ride · Z2 Endurance', {
+    activityName: 'Free Ride - Island Causeway',
+    sceneryName: 'Island Causeway',
+  });
+  for (let i = 0; i < 6; i++) {
+    recorder.recordSample({
+      timestampMs: t0 + (i + 1) * 1000,
+      dtSec: 1,
+      elapsedSec: i + 1,
+      power: 190,
+      heartRate: 138,
+      cadence: 88,
+      speedKmh: 36,
+      gradePct: 1,
+      stepIndex: 2,
+      stepLabel: 'Free Ride · Z2 Endurance',
+    });
+  }
+  const ride = recorder.finalize(t0 + 6000);
+  assert.ok(ride);
+  assert.equal(ride.activityName, 'Free Ride - Island Causeway');
+
+  const bytes = encodeRideToFit(ride);
+  const summary = verifyFitBinary(bytes);
+  assert.equal(summary.validHeaderSignature, true);
+  assert.equal(summary.headerCrcValid, true);
+  assert.equal(summary.fileCrcValid, true);
+  assert.equal(summary.sportActivityName, 'Free Ride - Island Causeway');
+  assert.equal(summary.workoutActivityName, 'Free Ride - Island Causeway');
+
+  const fileName = buildFitFileName(ride);
+  assert.ok(
+    fileName.startsWith('EndlessHorizon_Free-Ride-Island-Causeway_'),
+    `Unexpected FIT filename: ${fileName}`
+  );
+});
+
+test('lineArtTracer extracts an ordered polyline from RGBA pixels and Single-Line Bike produces 1:1 conformal GPS plot', () => {
+  // 1) Synthetic 64x64 white canvas with a crisp dark L-shaped single-stroke line
+  const w = 64;
+  const h = 64;
+  const rgba = new Uint8ClampedArray(w * h * 4).fill(255);
+  const paintDark = (x: number, y: number) => {
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        const px = x + dx;
+        const py = y + dy;
+        if (px >= 0 && px < w && py >= 0 && py < h) {
+          const idx = (py * w + px) * 4;
+          rgba[idx] = 10;
+          rgba[idx + 1] = 10;
+          rgba[idx + 2] = 10;
+          rgba[idx + 3] = 255;
+        }
+      }
+    }
+  };
+  for (let x = 8; x <= 48; x++) paintDark(x, 52);
+  for (let y = 52; y >= 12; y--) paintDark(48, y);
+
+  const traced = traceLineDrawingRgba(rgba, w, h);
+  assert.ok(traced.points.length >= 3, `Expected >= 3 traced points, got ${traced.points.length}`);
+  assert.ok(traced.edgeCoverage >= 0.9, `Expected >= 90% coverage, got ${traced.edgeCoverage}`);
+
+  // 2) Verify built-in Single-Line Bike GPS Art path preserves 1:1 conformal aspect ratio around Ura-shima
+  assert.ok(BIKE_LINE_ART_POINTS.length > 100);
+  assert.ok(BIKE_LINE_ART_POINTS[0].x < 0.05 && BIKE_LINE_ART_POINTS[0].y < 0.05);
+  const lastPt = BIKE_LINE_ART_POINTS[BIKE_LINE_ART_POINTS.length - 1];
+  assert.ok(lastPt.x > 2.3 && lastPt.y < 0.05);
+
+  const compiled = compileGpsRoute('bike-line-art', 'Single-Line Bike', BIKE_LINE_ART_POINTS, 15000, false);
+  let minLat = Infinity;
+  let maxLat = -Infinity;
+  let minLon = Infinity;
+  let maxLon = -Infinity;
+  for (let d = 0; d <= compiled.totalLengthM; d += 25) {
+    const pt = sampleCompiledRouteGps(compiled, d);
+    if (pt.latDeg < minLat) minLat = pt.latDeg;
+    if (pt.latDeg > maxLat) maxLat = pt.latDeg;
+    if (pt.lonDeg < minLon) minLon = pt.lonDeg;
+    if (pt.lonDeg > maxLon) maxLon = pt.lonDeg;
+  }
+  const cosLat = Math.cos((URASHIMA_CENTER_LAT * Math.PI) / 180);
+  const gpsAspect = ((maxLon - minLon) * cosLat) / (maxLat - minLat);
+  const srcMinX = Math.min(...BIKE_LINE_ART_POINTS.map((p) => p.x));
+  const srcMaxX = Math.max(...BIKE_LINE_ART_POINTS.map((p) => p.x));
+  const srcMinY = Math.min(...BIKE_LINE_ART_POINTS.map((p) => p.y));
+  const srcMaxY = Math.max(...BIKE_LINE_ART_POINTS.map((p) => p.y));
+  const srcAspect = (srcMaxX - srcMinX) / (srcMaxY - srcMinY);
+  assert.ok(
+    Math.abs(gpsAspect - srcAspect) < 0.03,
+    `Expected conformal 1:1 GPS aspect (${srcAspect.toFixed(3)}), got ${gpsAspect.toFixed(3)}`
+  );
+});
+
+test('GPS Art corner curvature stays bounded on tight 180-deg hairpins and drives smooth non-folding 3D road bends', () => {
+  // Construct a sharp 180-degree right hairpin (goes East, makes a tiny-radius U-turn right, returns West)
+  const hairpinPts = [
+    { x: 0, y: 0.5 },
+    { x: 1.0, y: 0.5 },
+    { x: 1.02, y: 0.48 },
+    { x: 1.0, y: 0.46 },
+    { x: 0, y: 0.46 },
+  ];
+  const hairpin = compileGpsRoute('custom-drawing', 'Sharp Hairpin', hairpinPts, 4000, false);
+
+  let maxAbsK = 0;
+  let peakRightK = 0;
+  for (let d = 0; d <= hairpin.totalLengthM; d += 10) {
+    const k = sampleCompiledRouteCurvature(hairpin, d);
+    assert.ok(Number.isFinite(k));
+    if (Math.abs(k) > maxAbsK) maxAbsK = Math.abs(k);
+    if (k > peakRightK) peakRightK = k;
+  }
+  assert.ok(
+    maxAbsK <= MAX_IN_GAME_CURVATURE + 1e-6,
+    `Expected bounded curvature <= ${MAX_IN_GAME_CURVATURE}, got ${maxAbsK}`
+  );
+  assert.ok(
+    peakRightK > MAX_IN_GAME_CURVATURE * 0.5,
+    `Expected strong positive (right-turn) curvature into right hairpin, got ${peakRightK}`
+  );
+
+  // Drive WorldRuntimeState curve LUT right before the hairpin apex (~1940m)
+  const rt = createWorldRuntime();
+  rt.gpsRoute = hairpin;
+  rt.distance = 1940;
+  updateRoadCurveLut(rt);
+  assert.equal(rt.curveLutReady, true);
+
+  // At rider position (z = 0), centerline stays anchored near x = 0
+  const atBike = sampleRoadAtZ(rt.distance, 0, { x: 0, y: 0, slopeX: 0, slopeY: 0 }, null, 0, null, rt);
+  assert.ok(Math.abs(atBike.x) < 0.25, `Expected road anchored near x=0 at bike, got ${atBike.x}`);
+
+  // Ahead into the right hairpin (z = -120m), road bends cleanly to +X (right) with bounded non-folding slope
+  const ahead = sampleRoadAtZ(rt.distance, -120, { x: 0, y: 0, slopeX: 0, slopeY: 0 }, null, 0, null, rt);
+  assert.ok(ahead.x > 10, `Expected visible right corner bend (+X > 10m), got ${ahead.x.toFixed(2)}m`);
+  const maxAllowedSlope = Math.tan(MAX_VISIBLE_HEADING_RAD) + 1e-4;
+  assert.ok(
+    Math.abs(ahead.slopeX) <= maxAllowedSlope,
+    `Expected non-folding road slope <= ${maxAllowedSlope.toFixed(3)}, got ${ahead.slopeX.toFixed(3)}`
+  );
+});
+
+test('computeCornerLeanAngle leans bike INTO corners (negative Z roll for right turns, positive Z roll for left turns)', () => {
+  // Stopped bike stands upright
+  assert.equal(computeCornerLeanAngle(0.02, true, 0), 0);
+  assert.equal(computeCornerLeanAngle(-0.02, true, 0.4), 0);
+
+  // Right turn (curvature > 0) -> negative rotation.z in Three.js tilts top of bike RIGHT (+X)
+  const rightGpsLean = computeCornerLeanAngle(0.015, true, 10);
+  assert.ok(rightGpsLean < 0 && rightGpsLean >= -0.28, `Expected negative roll for right GPS corner, got ${rightGpsLean}`);
+  const rightDefaultLean = computeCornerLeanAngle(0.12, false, 10);
+  assert.ok(rightDefaultLean < 0 && rightDefaultLean >= -0.22);
+
+  // Left turn (curvature < 0) -> positive rotation.z tilts top of bike LEFT (-X)
+  const leftGpsLean = computeCornerLeanAngle(-0.015, true, 10);
+  assert.ok(leftGpsLean > 0 && leftGpsLean <= 0.28, `Expected positive roll for left GPS corner, got ${leftGpsLean}`);
+  const leftDefaultLean = computeCornerLeanAngle(-0.12, false, 10);
+  assert.ok(leftDefaultLean > 0 && leftDefaultLean <= 0.22);
+});
+
+test('adaptive music engine logic maps Z5/6/7->Z5, enforces 3s hysteresis, 5s interval anticipation, and Low quality budget', () => {
+  // Key of A minor 8-bar progression starts with Am, F, C, G
+  assert.equal(AM_CHORD_PROGRESSION_8BAR.length, 8);
+  assert.deepEqual(
+    AM_CHORD_PROGRESSION_8BAR.slice(0, 4).map((c) => c.name),
+    ['Am', 'F', 'C', 'G']
+  );
+
+  // Zones 5, 6, 7 all map to MusicZone 5
+  assert.equal(mapCogganToMusicZone(1), 1);
+  assert.equal(mapCogganToMusicZone(4), 4);
+  assert.equal(mapCogganToMusicZone(5), 5);
+  assert.equal(mapCogganToMusicZone(6), 5);
+  assert.equal(mapCogganToMusicZone(7), 5);
+
+  // Exact BPM ladder & smooth 4-bar ramp duration
+  assert.deepEqual(ZONE_BPM, { 1: 90, 2: 100, 3: 110, 4: 122, 5: 132 });
+  const rampSec = computeFourBarRampSeconds(100, 120);
+  assert.ok(rampSec > 8.5 && rampSec < 9.0, `Expected ~8.73s 4-bar ramp, got ${rampSec}`);
+
+  // Quality Low disables reverb, extra high arp, lead, and saturation
+  const lowZ5 = computeEffectiveMusicLayers(5, 'low', true);
+  assert.equal(lowZ5.reverbWet, 0);
+  assert.equal(lowZ5.highArp, 0);
+  assert.equal(lowZ5.lead, 0);
+  assert.equal(lowZ5.saturationWet, 0);
+  assert.ok(lowZ5.kick > 0 && lowZ5.bass > 0);
+
+  // 3-second hysteresis ignores brief spikes and switches only after 3.0s stability
+  let hState = createZoneHysteresisState(2);
+  let res = stepZoneHysteresis(hState, 4, 2.5);
+  assert.equal(res.changed, false);
+  assert.equal(res.activeZone, 2);
+  hState = res.nextState;
+
+  // Brief dip back resets timer
+  res = stepZoneHysteresis(hState, 2, 0.25);
+  assert.equal(res.changed, false);
+  hState = res.nextState;
+
+  // Continuous 3.0s at Z4 triggers UP switch
+  res = stepZoneHysteresis(hState, 4, 1.5);
+  assert.equal(res.changed, false);
+  res = stepZoneHysteresis(res.nextState, 4, 1.5);
+  assert.equal(res.changed, true);
+  assert.equal(res.activeZone, 4);
+  assert.equal(res.direction, 'up');
+
+  // Target vs Actual (3s avg) resolution
+  assert.equal(
+    resolveMusicCandidateZone({
+      followMode: 'target',
+      rideMode: 'workout',
+      targetStepZone: 4,
+      freeRideZone: 2,
+      power3sAvg: 120,
+      ftp: 250,
+    }),
+    4
+  );
+  assert.equal(
+    resolveMusicCandidateZone({
+      followMode: 'actual',
+      rideMode: 'workout',
+      targetStepZone: 4,
+      freeRideZone: 2,
+      power3sAvg: 300, // 120% FTP -> Z5/Z6 -> MusicZone 5
+      ftp: 250,
+    }),
+    5
+  );
+
+  // 5-second interval anticipation fires only when next step steps UP a music zone
+  const stepUp = evaluateIntervalAnticipation({
+    runState: 'running',
+    rideMode: 'workout',
+    countdownSec: 5,
+    currentMusicZone: 2,
+    nextStepPowerLow: 0.95, // Z4
+  });
+  assert.equal(stepUp.active, true);
+  assert.equal(stepUp.nextMusicZone, 4);
+
+  const stepDown = evaluateIntervalAnticipation({
+    runState: 'running',
+    rideMode: 'workout',
+    countdownSec: 4,
+    currentMusicZone: 4,
+    nextStepPowerLow: 0.5, // Z1
+  });
+  assert.equal(stepDown.active, false);
+});
+
 
 
 

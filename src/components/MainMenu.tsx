@@ -1,5 +1,5 @@
 import { useMemo } from 'react';
-import { Bluetooth, BookOpen, History, Mountain, Play, Settings, SlidersHorizontal, Volume2, VolumeX, Zap } from 'lucide-react';
+import { Bluetooth, BookOpen, History, Mountain, Play, Route, Settings, SlidersHorizontal, Volume2, VolumeX, Zap } from 'lucide-react';
 import { formatClock } from '../core/zones';
 import { SceneryTheme, useAppStore } from '../store/useAppStore';
 import { getBrowserCompatibility } from '../utils/browserCheck';
@@ -18,6 +18,8 @@ export function MainMenu() {
   const activeWorkout = useAppStore((s) => s.activeWorkout);
   const ftp = useAppStore((s) => s.ftp);
   const sceneryTheme = useAppStore((s) => s.sceneryTheme);
+  const sceneryCycleMinutes = useAppStore((s) => s.sceneryCycleMinutes);
+  const activeGpsRoute = useAppStore((s) => s.activeGpsRoute);
   const trainerStatus = useAppStore((s) => s.trainerStatus);
   const hrStatus = useAppStore((s) => s.hrStatus);
   const savedRidesCount = useAppStore((s) => s.savedRides.length);
@@ -244,6 +246,28 @@ export function MainMenu() {
                   ))}
                 </div>
               </div>
+
+              <button
+                type="button"
+                onClick={() => setActiveModal('settings')}
+                data-testid="menu-gps-route-summary"
+                className="w-full min-h-[42px] px-3 rounded-md bg-[#0b0920] border border-cyan-500/35 hover:border-cyan-400/70 flex items-center justify-between gap-2 text-xs transition-colors"
+              >
+                <span className="flex items-center gap-1.5 text-slate-300 truncate">
+                  <Route className="w-3.5 h-3.5 text-cyan-300 shrink-0" />
+                  <span className="truncate">
+                    GPS Route:{' '}
+                    <strong className="text-cyan-200">
+                      {activeGpsRoute
+                        ? `${activeGpsRoute.name} · ${(activeGpsRoute.totalLengthM / 1000).toFixed(0)} km`
+                        : 'Ura-shima Loop'}
+                    </strong>
+                  </span>
+                </span>
+                <span className="text-[11px] font-display text-pink-300 shrink-0">
+                  {sceneryCycleMinutes > 0 ? `Cycle ${sceneryCycleMinutes}m` : 'Change'}
+                </span>
+              </button>
 
               <div className="flex items-center justify-between text-xs text-slate-300 border-t border-cyan-500/20 pt-2.5">
                 <span>

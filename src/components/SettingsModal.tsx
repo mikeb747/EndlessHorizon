@@ -1,6 +1,34 @@
-import { Gauge, Keyboard, Layers, Monitor, Sliders, Volume2, VolumeX, X } from 'lucide-react';
-import { QualityLevel, SceneryTheme, useAppStore } from '../store/useAppStore';
+import { ChangeEvent, useRef, useState } from 'react';
+import {
+  Gauge,
+  Keyboard,
+  Layers,
+  Monitor,
+  Music2,
+  RefreshCw,
+  Route,
+  Sliders,
+  Square,
+  Upload,
+  Volume2,
+  VolumeX,
+  X,
+} from 'lucide-react';
+import { MusicZone, ZONE_BPM } from '../audio/musicEngineLogic';
+import {
+  BIKE_LINE_ART_POINTS,
+  GPS_ROUTE_PRESETS,
+  GpsRoutePresetId,
+} from '../recording/gpsRoutes';
+import { traceImageFileToNormalizedPath } from '../recording/lineArtTracer';
+import {
+  QualityLevel,
+  SceneryCycleMinutes,
+  SceneryTheme,
+  useAppStore,
+} from '../store/useAppStore';
 import { FtpInput } from './FtpInput';
+import { GpsRoutePreviewSvg } from './GpsRoutePreviewSvg';
 
 const SCENERY_OPTIONS: Array<{ id: SceneryTheme; title: string; subtitle: string }> = [
   {
@@ -31,12 +59,46 @@ const QUALITY_OPTIONS: Array<{ id: QualityLevel; label: string; desc: string }> 
   { id: 'high', label: 'High', desc: 'Full Synthwave · Reflections, bloom, aberration & streaks' },
 ];
 
+const SCENERY_CYCLE_OPTIONS: Array<{ value: SceneryCycleMinutes; label: string }> = [
+  { value: 0, label: 'Off' },
+  { value: 5, label: '5 min' },
+  { value: 10, label: '10 min' },
+  { value: 15, label: '15 min' },
+];
+
+const GPS_DISTANCE_OPTIONS: Array<{ km: number; label: string }> = [
+  { km: 0, label: 'Auto Fit' },
+  { km: 5, label: '5 km' },
+  { km: 10, label: '10 km' },
+  { km: 15, label: '15 km' },
+  { km: 20, label: '20 km' },
+  { km: 30, label: '30 km' },
+];
+
+const MUSIC_TEST_ZONES: Array<{ zone: MusicZone; label: string; desc: string }> = [
+  { zone: 1, label: 'Z1', desc: 'Warm detuned pad, sparse soft arp, closed filter & large reverb' },
+  { zone: 2, label: 'Z2', desc: 'Adds root-note bass, soft kick & filtered shaker' },
+  { zone: 3, label: 'Z3', desc: 'Adds 4-on-floor kick, beats 2/4 claps, off-beat hats & 16th pluck arp' },
+  { zone: 4, label: 'Z4', desc: 'Adds driving 8th bass, open hats, lead melody, open filter & sidechain pump' },
+  { zone: 5, label: 'Z5', desc: 'Adds 16th bass, snare rolls, bright supersaw lead, high arp & saturation' },
+];
+
 export function SettingsModal() {
   const setActiveModal = useAppStore((s) => s.setActiveModal);
   const ftp = useAppStore((s) => s.ftp);
   const setFtp = useAppStore((s) => s.setFtp);
   const sceneryTheme = useAppStore((s) => s.sceneryTheme);
   const setSceneryTheme = useAppStore((s) => s.setSceneryTheme);
+  const sceneryCycleMinutes = useAppStore((s) => s.sceneryCycleMinutes);
+  const setSceneryCycleMinutes = useAppStore((s) => s.setSceneryCycleMinutes);
+  const gpsRoutePreset = useAppStore((s) => s.gpsRoutePreset);
+  const setGpsRoutePreset = useAppStore((s) => s.setGpsRoutePreset);
+  const gpsRouteTargetKm = useAppStore((s) => s.gpsRouteTargetKm);
+  const setGpsRouteTargetKm = useAppStore((s) => s.setGpsRouteTargetKm);
+  const customGpsRouteName = useAppStore((s) => s.customGpsRouteName);
+  const customGpsRoutePoints = useAppStore((s) => s.customGpsRoutePoints);
+  const setCustomGpsRoute = useAppStore((s) => s.setCustomGpsRoute);
+  const activeGpsRoute = useAppStore((s) => s.activeGpsRoute);
   const quality = useAppStore((s) => s.quality);
   const setQuality = useAppStore((s) => s.setQuality);
   const showHoloCards = useAppStore((s) => s.showHoloCards);
@@ -59,6 +121,42 @@ export function SettingsModal() {
   const setAudioMenuVolume = useAppStore((s) => s.setAudioMenuVolume);
   const audioRideVolume = useAppStore((s) => s.audioRideVolume);
   const setAudioRideVolume = useAppStore((s) => s.setAudioRideVolume);
+  const musicFollowMode = useAppStore((s) => s.musicFollowMode);
+  const setMusicFollowMode = useAppStore((s) => s.setMusicFollowMode);
+  const musicTestZone = useAppStore((s) => s.musicTestZone);
+  const setMusicTestZone = useAppStore((s) => s.setMusicTestZone);
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [uploadStatus, setUploadStatus] = useState<string | null>(null);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+
+  const handleLineArtUpload = async (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    setUploadError(null);
+    setUploadStatus('Tracing line drawing into 1:1 GPS route...');
+    try {
+      const traced = await traceImageFileToNormalizedPath(file);
+      const baseName = file.name.replace(/\.[^.]+$/, '').trim() || 'Custom Drawing';
+      setCustomGpsRoute(baseName, traced.points, traced.closedLoop);
+      setUploadStatus(
+        `Traced "${baseName}" (${traced.points.length} GPS waypoints, ${Math.round(traced.edgeCoverage * 100)}% stroke coverage)`
+      );
+    } catch (err) {
+      setUploadStatus(null);
+      setUploadError(
+        err instanceof Error ? err.message : 'Could not trace drawing. Try a crisp dark-on-light line image.'
+      );
+    }
+  };
+
+  const previewPoints =
+    gpsRoutePreset === 'custom-drawing' && customGpsRoutePoints.length >= 2
+      ? customGpsRoutePoints
+      : gpsRoutePreset === 'bike-line-art'
+        ? BIKE_LINE_ART_POINTS
+        : null;
 
   const isAudioAudible = audioEnabled && !audioMuted && audioMasterVolume > 0;
   const masterPct = Math.round(audioMasterVolume * 100);
@@ -84,7 +182,10 @@ export function SettingsModal() {
           </div>
           <button
             type="button"
-            onClick={() => setActiveModal(null)}
+            onClick={() => {
+              setMusicTestZone(null);
+              setActiveModal(null);
+            }}
             className="w-12 h-12 rounded-md border border-cyan-500/40 text-slate-200 hover:bg-cyan-500/20 flex items-center justify-center"
             aria-label="Close settings dialog"
           >
@@ -242,9 +343,92 @@ export function SettingsModal() {
                 />
               </div>
 
-              <p className="text-[11px] text-slate-400 leading-snug">
-                Procedural Web Audio synthwave soundtrack: ambient horizon pads on the Main Menu, shifting into zone-reactive bass and arpeggio pulse during rides.
-              </p>
+              {/* Music Follows: Target Power vs Actual Power (3s avg) */}
+              <div className="pt-2 border-t border-cyan-500/20 space-y-2">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-xs font-semibold text-white">Music Follows</span>
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      disabled={!audioEnabled}
+                      onClick={() => setMusicFollowMode('target')}
+                      data-testid="music-follow-target"
+                      className={`min-h-[36px] px-3 rounded-md font-display text-xs font-bold border transition-colors disabled:cursor-not-allowed ${
+                        musicFollowMode === 'target'
+                          ? 'bg-cyan-500/25 border-cyan-400 text-white'
+                          : 'bg-[#070516] border-slate-700 text-slate-300 hover:border-cyan-400/50'
+                      }`}
+                    >
+                      Target Power
+                    </button>
+                    <button
+                      type="button"
+                      disabled={!audioEnabled}
+                      onClick={() => setMusicFollowMode('actual')}
+                      data-testid="music-follow-actual"
+                      className={`min-h-[36px] px-3 rounded-md font-display text-xs font-bold border transition-colors disabled:cursor-not-allowed ${
+                        musicFollowMode === 'actual'
+                          ? 'bg-pink-500/25 border-pink-400 text-white'
+                          : 'bg-[#070516] border-slate-700 text-slate-300 hover:border-pink-400/50'
+                      }`}
+                    >
+                      Actual Power (3s Avg)
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              {/* Adaptive Music Zone Test Panel (Z1..Z5) */}
+              <div className="pt-2 border-t border-cyan-500/20 space-y-2" data-testid="music-test-panel">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-semibold text-white flex items-center gap-1.5">
+                    <Music2 className="w-3.5 h-3.5 text-pink-300" />
+                    Test Adaptive Music Zones (A Minor · Tone.js)
+                  </span>
+                  {musicTestZone !== null && (
+                    <button
+                      type="button"
+                      onClick={() => setMusicTestZone(null)}
+                      data-testid="music-test-stop"
+                      className="min-h-[30px] px-2.5 rounded bg-pink-500/20 border border-pink-400/70 text-pink-100 hover:bg-pink-500/35 font-display text-[11px] font-bold flex items-center gap-1"
+                    >
+                      <Square className="w-3 h-3 fill-current" />
+                      Stop Test
+                    </button>
+                  )}
+                </div>
+
+                <div className="grid grid-cols-5 gap-1.5">
+                  {MUSIC_TEST_ZONES.map((item) => {
+                    const active = musicTestZone === item.zone;
+                    return (
+                      <button
+                        key={item.zone}
+                        type="button"
+                        disabled={!audioEnabled}
+                        onClick={() => setMusicTestZone(active ? null : item.zone)}
+                        data-testid={`music-test-z${item.zone}`}
+                        className={`min-h-[44px] py-1.5 px-1 rounded-md border font-display text-center transition-colors disabled:cursor-not-allowed ${
+                          active
+                            ? 'bg-pink-500/30 border-pink-400 text-white shadow-[0_0_12px_rgba(255,42,157,0.35)]'
+                            : 'bg-[#070516] border-slate-700 text-slate-200 hover:border-cyan-400/60'
+                        }`}
+                      >
+                        <div className="text-xs font-extrabold">{item.label}</div>
+                        <div className="text-[10px] tabular-nums text-cyan-300/90">
+                          {ZONE_BPM[item.zone]} BPM
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+
+                <p className="text-[11px] text-slate-300/90 leading-snug" data-testid="music-test-description">
+                  {musicTestZone !== null
+                    ? `Auditioning Z${musicTestZone} (${ZONE_BPM[musicTestZone]} BPM): ${MUSIC_TEST_ZONES[musicTestZone - 1].desc}`
+                    : 'Click Z1–Z5 to preview each procedural synthwave layer without riding. Menu music crossfades into adaptive ride music automatically; press M to mute.'}
+                </p>
+              </div>
             </div>
           </section>
 
@@ -274,6 +458,158 @@ export function SettingsModal() {
                   </button>
                 );
               })}
+            </div>
+            {/* Seamless Mid-Ride Scenery Auto-Cycle */}
+            <div className="rounded-lg bg-[#0a0820] border border-pink-500/30 p-3.5 space-y-2.5">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2 text-xs font-bold text-white">
+                  <RefreshCw className="w-3.5 h-3.5 text-pink-300" />
+                  Auto-Switch Scenery Mid-Ride
+                </div>
+                <div className="flex items-center gap-1.5">
+                  {SCENERY_CYCLE_OPTIONS.map((opt) => (
+                    <button
+                      key={opt.value}
+                      type="button"
+                      onClick={() => setSceneryCycleMinutes(opt.value)}
+                      data-testid={`scenery-cycle-${opt.value}`}
+                      className={`min-h-[36px] px-2.5 rounded-md font-display text-xs font-bold border transition-colors ${
+                        sceneryCycleMinutes === opt.value
+                          ? 'bg-pink-500/25 border-pink-400 text-white'
+                          : 'bg-[#070516] border-slate-700 text-slate-300 hover:border-cyan-400/50'
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <p className="text-[11px] text-slate-400 leading-snug">
+                Seamlessly transitions to the next 3D world through a horizon mist veil without dropping frames.
+              </p>
+            </div>
+          </section>
+
+          {/* GPS Art Line-Drawing Route & In-Game Corners */}
+          <section className="space-y-3" data-testid="settings-gps-route-section">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h3 className="font-display text-xs font-bold tracking-[0.16em] text-cyan-300 uppercase flex items-center gap-2">
+                <Route className="w-4 h-4" />
+                GPS Art Route &amp; In-Game Corners
+              </h3>
+              <div>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept=".png,.jpg,.jpeg,.svg,.webp,image/*"
+                  onChange={handleLineArtUpload}
+                  className="hidden"
+                  data-testid="gps-route-file-input"
+                />
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  data-testid="btn-upload-line-drawing"
+                  className="min-h-[38px] px-3 rounded-md bg-cyan-500/20 border border-cyan-400/75 text-cyan-100 hover:bg-cyan-500/30 font-display text-xs font-bold flex items-center gap-1.5 transition-colors"
+                >
+                  <Upload className="w-3.5 h-3.5" />
+                  Upload Line Drawing
+                </button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+              {GPS_ROUTE_PRESETS.map((preset) => {
+                const active = gpsRoutePreset === preset.id;
+                const isCustomEmpty =
+                  preset.id === 'custom-drawing' && customGpsRoutePoints.length < 2;
+                return (
+                  <button
+                    key={preset.id}
+                    type="button"
+                    onClick={() => {
+                      if (isCustomEmpty) {
+                        fileInputRef.current?.click();
+                      } else {
+                        setGpsRoutePreset(preset.id as GpsRoutePresetId);
+                      }
+                    }}
+                    data-testid={`gps-preset-${preset.id}`}
+                    className={`min-h-[78px] p-3 rounded-lg border-2 text-left transition-colors ${
+                      active
+                        ? 'bg-cyan-500/20 border-cyan-400 text-white shadow-[0_0_14px_rgba(0,240,255,0.25)]'
+                        : 'bg-[#0a0820] border-slate-700/80 text-slate-300 hover:border-cyan-400/50'
+                    }`}
+                  >
+                    <div className="font-display text-xs font-bold">
+                      {preset.id === 'custom-drawing' && customGpsRouteName
+                        ? customGpsRouteName
+                        : preset.name}
+                    </div>
+                    <p className="text-[11px] text-slate-300/80 mt-1 leading-tight">
+                      {preset.subtitle}
+                    </p>
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Distance scale + Live 1:1 GPS Plot Preview */}
+            <div className="rounded-lg bg-[#0a0820] border border-cyan-500/30 p-3.5 space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="text-xs font-semibold text-slate-200">
+                  Drawing Scale Distance
+                  {activeGpsRoute ? (
+                    <span className="text-cyan-300 font-display ml-1.5 tabular-nums">
+                      ({(activeGpsRoute.totalLengthM / 1000).toFixed(1)} km)
+                    </span>
+                  ) : null}
+                </span>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {GPS_DISTANCE_OPTIONS.map((opt) => (
+                    <button
+                      key={opt.km}
+                      type="button"
+                      onClick={() => setGpsRouteTargetKm(opt.km)}
+                      data-testid={`gps-dist-${opt.km}`}
+                      className={`min-h-[34px] px-2.5 rounded font-display text-[11px] font-bold border transition-colors ${
+                        gpsRouteTargetKm === opt.km
+                          ? 'bg-cyan-500/25 border-cyan-400 text-white'
+                          : 'bg-[#070516] border-slate-700 text-slate-300 hover:border-cyan-400/50'
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {previewPoints ? (
+                <div
+                  className="rounded-md border border-cyan-500/25 bg-[#060414] p-2"
+                  data-testid="settings-gps-preview"
+                >
+                  <GpsRoutePreviewSvg
+                    points={previewPoints}
+                    height={96}
+                    label="1:1 GPS Art route preview"
+                  />
+                </div>
+              ) : (
+                <div className="rounded-md border border-cyan-500/20 bg-[#060414] px-3 py-3 text-xs text-slate-400 text-center">
+                  Classic Ura-shima coastal GPS loop active (~4.4 km repeating laps with gentle road sweep).
+                </div>
+              )}
+
+              {uploadStatus && (
+                <p className="text-xs text-emerald-300 font-medium">{uploadStatus}</p>
+              )}
+              {uploadError && (
+                <p className="text-xs text-pink-300 font-medium">{uploadError}</p>
+              )}
+              <p className="text-[11px] text-slate-400 leading-snug">
+                Recorded .FIT GPS coordinates match the line drawing 1:1 on Strava. In-game 3D corners mirror the straights and turns while softening tiny-radius 180° hairpins into sharp, rideable bends.
+              </p>
             </div>
           </section>
 
