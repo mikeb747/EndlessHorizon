@@ -42,12 +42,22 @@ jobs:
       - name: Run unit tests
         run: npm test
 
-      - name: Build standalone production bundle
+      - name: Build production frontend & 1-click local app bundle
         env:
-          VITE_BASE_PATH: ./
-        run: npm run build
+          VITE_BASE_PATH: /
+        run: |
+          npm run build
+          npm run build:local
 
-      - name: Upload dist build artifact
+      - name: Upload 1-click local app artifact (with Strava backend)
+        uses: actions/upload-artifact@v4
+        with:
+          name: endless-horizon-cycling-1click-local
+          path: release-local/
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload static dist artifact
         uses: actions/upload-artifact@v4
         with:
           name: endless-horizon-cycling-dist

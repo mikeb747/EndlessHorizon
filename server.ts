@@ -4,15 +4,24 @@
  * and proxies .FIT activity uploads to Strava's v3 Uploads API.
  */
 
-import 'dotenv/config';
+import dotenv from 'dotenv';
 import express from 'express';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { verifyStravaUploadAccess } from './src/server/uploadAuth';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// Load env files in priority order (never overriding existing process.env secrets):
+// 1. Current working directory .env
+// 2. Folder containing server.ts / server.mjs
+// 3. Persistent local user config (~/.endless-horizon-cycling.env) so new local builds keep Strava keys
+dotenv.config();
+dotenv.config({ path: path.join(__dirname, '.env') });
+dotenv.config({ path: path.join(os.homedir(), '.endless-horizon-cycling.env') });
 
 const PORT = Number(process.env.PORT || 3000);
 const IS_PROD = process.env.NODE_ENV === 'production';
@@ -171,6 +180,11 @@ async function startServer() {
   const app = express();
   app.set('trust proxy', 1);
   app.use(express.json({ limit: '14mb' }));
+
+  // 0) Health check for local 1-click launcher
+  app.get('/api/health', (_req, res) => {
+    res.json({ ok: true, app: 'endless-horizon-cycling' });
+  });
 
   // 1) Strava integration status (never returns tokens or secrets)
   app.get('/api/strava/status', (_req, res) => {
@@ -486,8 +500,18 @@ async function startServer() {
     }
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Endless Horizon Cycling server running on http://0.0.0.0:${PORT}`);
+  const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Endless Horizon Cycling server running on http://localhost:${PORT}`);
+  });
+
+  server.on('error', (err: NodeJS.ErrnoException) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(
+        `Port ${PORT} is already in use. Endless Horizon Cycling may already be running at http://localhost:${PORT}`
+      );
+      process.exit(1);
+    }
+    throw err;
   });
 }
 
