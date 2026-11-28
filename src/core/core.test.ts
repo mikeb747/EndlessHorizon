@@ -14,6 +14,7 @@ import {
 } from './freeRide';
 import { AUTO_PAUSE_DELAY_SEC, evaluateAutoPause } from './autoPause';
 import { evaluateWorkoutAtTime, RollingPowerBuffer, calculateLiveTss } from './workoutEngine';
+import { WorkoutWallClock } from './workoutClock';
 import { clampFtp, WorkoutEngine, WorkerLike } from '../logic/WorkoutEngine';
 import {
   buildWorkoutElevationProfile,
@@ -50,11 +51,35 @@ import {
   updateRoadCurveLut,
   WORLD_CAMERA_NEAR,
 } from '../world/roadMath';
+import {
+  DEGRADATION_ORDER,
+  detectRecommendedQuality,
+  getEffectiveRenderConfig,
+  GraphicsGovernor,
+} from '../world/graphicsGovernor';
+import {
+  createRoadProfileUniformArray,
+  getUnifiedSkyThemeParams,
+  packRoadProfileUniforms,
+  ROAD_PROFILE_COUNT,
+  ROAD_SEGMENT_Z,
+} from '../world/roadShaderHelpers';
 import type {
   WorkoutEngineWorkerCommand,
   WorkoutEngineWorkerEvent,
 } from '../workers/workoutEngine.worker';
-import { RideRecorder } from '../recording/rideRecorder';
+import {
+  CHECKPOINT_INTERVAL_MS,
+  finalizeRecoveryToSavedRide,
+  RideRecorder,
+} from '../recording/rideRecorder';
+import { assembleRecoveryFromChunks } from '../recording/rideStorage';
+import {
+  IncrementalTssTracker,
+  LiveTelemetryBuffer,
+  RideHistoryBuffer,
+  TelemetryRingReadout,
+} from '../recording/telemetryBuffer';
 import { buildFitFileName, encodeRideToFit, verifyFitBinary } from '../recording/fitEncoder';
 import {
   BIKE_LINE_ART_POINTS,
@@ -63,6 +88,7 @@ import {
   sampleCompiledRouteCurvature,
   sampleCompiledRouteGps,
 } from '../recording/gpsRoutes';
+import { verifyStravaUploadAccess } from '../server/uploadAuth';
 import { traceLineDrawingRgba } from '../recording/lineArtTracer';
 import {
   FIT_SPORT_CYCLING,
@@ -78,6 +104,32 @@ import {
   parseFtmsIndoorBikeData,
   parseHeartRateMeasurement,
 } from '../devices/bleParsers';
+import {
+  computeReconnectBackoffMs,
+  loadSavedDevices,
+  removeSavedDevice,
+  runTrainerReconnectRecovery,
+  saveSavedDevices,
+  upsertSavedDevice,
+} from '../devices/devicePersistence';
+import {
+  CoalescingErgQueue,
+  CONTROL_NOT_PERMITTED_MESSAGE,
+  FTMS_OP_REQUEST_CONTROL,
+  FTMS_OP_RESPONSE_CODE,
+  FTMS_RESULT_CONTROL_NOT_PERMITTED,
+  FTMS_RESULT_SUCCESS,
+  parseFtmsControlPointResponse,
+  withBluetoothRetry,
+  withBluetoothTimeout,
+} from '../devices/bleHardening';
+import {
+  BleCharacteristicLike,
+  BleDeviceLike,
+  WebBluetoothCadenceDevice,
+  WebBluetoothHeartRateDevice,
+  WebBluetoothTrainerDevice,
+} from '../devices/webBluetoothDevices';
 import {
   createCadenceMatcherState,
   solveTwoBoneLegIK,
@@ -1366,6 +1418,971 @@ test('adaptive music engine logic maps Z5/6/7->Z5, enforces 3s hysteresis, 5s in
   });
   assert.equal(stepDown.active, false);
 });
+
+test('Step 1: RideRecorder emits append-only delta chunks, reassembles out-of-order chunks, resumes, and exports valid FIT', () => {
+  const recorder = new RideRecorder();
+  const t0 = Date.UTC(2026, 10, 27, 10, 0, 0);
+  recorder.beginSession('w-step1', 'Progressions', 250, t0, 0, 'Warmup', {
+    activityName: 'Progressions - Neon City',
+    sceneryName: 'Neon City',
+    sessionId: 'sess-step1-test',
+  });
+
+  const storedChunks = [];
+  let latestMeta = null;
+
+  // Record 7 seconds in step 0 -> triggers checkpoint 0
+  for (let i = 1; i <= 7; i++) {
+    recorder.recordSample({
+      timestampMs: t0 + i * 1000,
+      dtSec: 1,
+      elapsedSec: i,
+      power: 160 + i,
+      heartRate: 130 + i,
+      cadence: 88,
+      speedKmh: 32,
+      gradePct: 2,
+      stepIndex: 0,
+      stepLabel: 'Warmup',
+    });
+  }
+  assert.equal(recorder.shouldCheckpoint(t0 + 5000, CHECKPOINT_INTERVAL_MS), false);
+  assert.equal(recorder.shouldCheckpoint(t0 + 7000, CHECKPOINT_INTERVAL_MS), true);
+
+  const p0 = recorder.extractCheckpointDelta({
+    rideMode: 'workout',
+    sceneryTheme: 'neon-city',
+    visitedSceneries: ['neon-city'],
+    elapsedSec: 7,
+    freeRideZone: 2,
+    freeRideOffsetWatts: 0,
+    nowMs: t0 + 7000,
+  });
+  assert.ok(p0 && p0.chunk);
+  assert.equal(p0.chunk.seq, 0);
+  assert.equal(p0.chunk.samples.length, 7);
+  assert.equal(p0.chunk.closedLaps.length, 0);
+  storedChunks.push(p0.chunk);
+  latestMeta = p0.meta;
+
+  // Immediately extracting again with no new samples returns null (append-only, no duplicates)
+  assert.equal(
+    recorder.extractCheckpointDelta({
+      rideMode: 'workout',
+      sceneryTheme: 'neon-city',
+      visitedSceneries: ['neon-city'],
+      elapsedSec: 7,
+      freeRideZone: 2,
+      freeRideOffsetWatts: 0,
+      nowMs: t0 + 7500,
+    }),
+    null
+  );
+
+  // Transition to step 1 and record 8 more seconds -> chunk 1 contains ONLY the 8 new samples + 1 closed lap
+  for (let i = 8; i <= 15; i++) {
+    recorder.recordSample({
+      timestampMs: t0 + i * 1000,
+      dtSec: 1,
+      elapsedSec: i,
+      power: 245,
+      heartRate: 158,
+      cadence: 92,
+      speedKmh: 36,
+      gradePct: 6,
+      stepIndex: 1,
+      stepLabel: 'Threshold Block',
+    });
+  }
+  const p1 = recorder.extractCheckpointDelta({
+    rideMode: 'workout',
+    sceneryTheme: 'neon-city',
+    visitedSceneries: ['neon-city'],
+    elapsedSec: 15,
+    freeRideZone: 2,
+    freeRideOffsetWatts: 0,
+    nowMs: t0 + 15000,
+  });
+  assert.ok(p1 && p1.chunk);
+  assert.equal(p1.chunk.seq, 1);
+  assert.equal(p1.chunk.samples.length, 8);
+  assert.equal(p1.chunk.closedLaps.length, 1);
+  assert.equal(p1.chunk.closedLaps[0].stepLabel, 'Warmup');
+  storedChunks.push(p1.chunk);
+  latestMeta = p1.meta;
+
+  // Simulate tab crash & recovery with out-of-order + duplicate chunks
+  const recovery = assembleRecoveryFromChunks(latestMeta, [storedChunks[1], storedChunks[0], storedChunks[1]]);
+  assert.equal(recovery.chunks.length, 2);
+  assert.equal(recovery.samples.length, 15);
+  assert.equal(recovery.laps.length, 1);
+  assert.equal(recovery.samples[0].elapsedSec, 1);
+  assert.equal(recovery.samples[14].elapsedSec, 15);
+
+  // Option A: Save & export unfinished ride directly to valid FIT
+  const recoveredSavedRide = finalizeRecoveryToSavedRide(recovery);
+  assert.equal(recoveredSavedRide.records.length, 15);
+  assert.equal(recoveredSavedRide.laps.length, 2);
+  assert.equal(recoveredSavedRide.activityName, 'Progressions - Neon City');
+  const fitSummary = verifyFitBinary(encodeRideToFit(recoveredSavedRide));
+  assert.equal(fitSummary.validHeaderSignature, true);
+  assert.equal(fitSummary.headerCrcValid, true);
+  assert.equal(fitSummary.fileCrcValid, true);
+  assert.equal(fitSummary.messageCountsByGlobalNum[20], 15);
+  assert.equal(fitSummary.messageCountsByGlobalNum[19], 2);
+
+  // Option B: Resume recording seamlessly into a fresh RideRecorder instance after reload
+  const resumed = new RideRecorder();
+  resumed.restoreFromRecovery(recovery, null);
+  assert.equal(resumed.getRecordCount(), 15);
+  assert.equal(resumed.getLapCount(), 2);
+  for (let i = 16; i <= 20; i++) {
+    resumed.recordSample({
+      timestampMs: t0 + i * 1000,
+      dtSec: 1,
+      elapsedSec: i,
+      power: 260,
+      heartRate: 162,
+      cadence: 94,
+      speedKmh: 38,
+      gradePct: 6,
+      stepIndex: 1,
+      stepLabel: 'Threshold Block',
+    });
+  }
+  const p2 = resumed.extractCheckpointDelta({
+    rideMode: 'workout',
+    sceneryTheme: 'neon-city',
+    visitedSceneries: ['neon-city'],
+    elapsedSec: 20,
+    freeRideZone: 2,
+    freeRideOffsetWatts: 0,
+    nowMs: t0 + 20000,
+  });
+  assert.ok(p2 && p2.chunk);
+  assert.equal(p2.chunk.seq, 2);
+  assert.equal(p2.chunk.samples.length, 5);
+
+  const finalRide = resumed.finalize(t0 + 20000);
+  assert.ok(finalRide);
+  assert.equal(finalRide.records.length, 20);
+  assert.equal(finalRide.laps.length, 2);
+});
+
+test('Step 2: saved device persistence, exponential backoff schedule, trainer reconnect ERG recovery, and HR/Cadence error surfacing', async () => {
+  // 1) localStorage persistence with upsert & role replacement
+  const storeMap = new Map<string, string>();
+  const mockStorage = {
+    getItem: (k: string) => storeMap.get(k) ?? null,
+    setItem: (k: string, v: string) => {
+      storeMap.set(k, v);
+    },
+  };
+
+  let list = loadSavedDevices(mockStorage);
+  assert.deepEqual(list, []);
+
+  list = upsertSavedDevice(list, { id: 'kickr-1', name: 'Wahoo KICKR V4', lastConnectedAt: 1000, role: 'trainer' });
+  list = upsertSavedDevice(list, { id: 'hrm-1', name: 'Polar H10', lastConnectedAt: 2000, role: 'hr' });
+  list = upsertSavedDevice(list, { id: 'kickr-2', name: 'Wahoo KICKR V6', lastConnectedAt: 3000, role: 'trainer' });
+  saveSavedDevices(list, mockStorage);
+
+  const reloaded = loadSavedDevices(mockStorage);
+  assert.equal(reloaded.length, 2, 'New trainer should replace prior trainer role');
+  assert.equal(reloaded[0].id, 'kickr-2');
+  assert.equal(reloaded[1].id, 'hrm-1');
+
+  const afterRemove = removeSavedDevice(reloaded, 'hrm-1');
+  assert.equal(afterRemove.length, 1);
+
+  // 2) Exponential backoff: 1s, 2s, 4s, 8s, 16s, 30s, 30s
+  assert.deepEqual(
+    [0, 1, 2, 3, 4, 5, 6].map((n) => computeReconnectBackoffMs(n)),
+    [1000, 2000, 4000, 8000, 16000, 30000, 30000]
+  );
+
+  // 3) Trainer reconnect recovery calls requestControl -> startResume -> setTargetPower in exact order
+  const callOrder: string[] = [];
+  const recovery = await runTrainerReconnectRecovery(
+    {
+      requestControl: async () => {
+        callOrder.push('requestControl');
+        return true;
+      },
+      startResume: async () => {
+        callOrder.push('startResume');
+      },
+      setTargetPower: async (w) => {
+        callOrder.push(`setTargetPower:${w}`);
+      },
+    },
+    265,
+    true
+  );
+  assert.deepEqual(callOrder, ['requestControl', 'startResume', 'setTargetPower:265']);
+  assert.equal(recovery.controlGranted, true);
+  assert.equal(recovery.started, true);
+  assert.equal(recovery.targetResentWatts, 265);
+
+  // 4) HR and Cadence devices surface explicit error messages rather than swallowing failures
+  const hr = new WebBluetoothHeartRateDevice();
+  await hr.connect();
+  assert.ok(
+    hr.getStatus().errorMessage && hr.getStatus().errorMessage!.includes('Web Bluetooth'),
+    `Expected explicit HR error message, got: ${hr.getStatus().errorMessage}`
+  );
+  const cad = new WebBluetoothCadenceDevice();
+  await cad.connect();
+  assert.ok(
+    cad.getStatus().errorMessage && cad.getStatus().errorMessage!.includes('Web Bluetooth'),
+    `Expected explicit Cadence error message, got: ${cad.getStatus().errorMessage}`
+  );
+});
+
+test('Step 3: BLE timeouts/retries, coalescing ERG queue, FTMS 0x80 Control Point responses, and Cycling Power fallback', async () => {
+  // 1) Step-labelled timeout rejects cleanly
+  await assert.rejects(
+    withBluetoothTimeout(new Promise(() => undefined), 25, 'gatt.connect'),
+    /\[BLE gatt\.connect\] Timed out after 25ms/
+  );
+
+  // 2) Retry succeeds on 3rd attempt
+  let attempts = 0;
+  const retriedVal = await withBluetoothRetry(
+    async () => {
+      attempts += 1;
+      if (attempts < 3) throw new Error('transient GATT busy');
+      return 'ok';
+    },
+    { stepLabel: 'getCharacteristic', timeoutMs: 200, maxAttempts: 3, retryDelayMs: 5 }
+  );
+  assert.equal(retriedVal, 'ok');
+  assert.equal(attempts, 3);
+
+  // 3) CoalescingErgQueue keeps only the latest target power and recovers cleanly from a stuck write timeout
+  const writtenWatts: number[] = [];
+  const queue = new CoalescingErgQueue({ writeTimeoutMs: 40, maxRetries: 1, retryDelayMs: 5 });
+
+  let firstAttemptStuck = true;
+  const p1 = queue.enqueueTargetPower(150, () => {
+    if (firstAttemptStuck) {
+      firstAttemptStuck = false;
+      return new Promise(() => undefined); // hangs forever -> triggers 40ms timeout!
+    }
+    writtenWatts.push(150);
+    return Promise.resolve();
+  }).catch(() => undefined);
+
+  // While p1 is stuck, enqueue 3 rapid targets; only the latest (320W) should be written!
+  const p2 = queue.enqueueTargetPower(200, async () => {
+    writtenWatts.push(200);
+  });
+  const p3 = queue.enqueueTargetPower(260, async () => {
+    writtenWatts.push(260);
+  });
+  const p4 = queue.enqueueTargetPower(320, async () => {
+    writtenWatts.push(320);
+  });
+  await Promise.all([p1, p2, p3, p4]);
+  assert.deepEqual(writtenWatts, [320]);
+  assert.equal(queue.getDroppedTargetsCount(), 3);
+
+  // 4) Parse FTMS 0x80 response codes (Success vs Control Not Permitted)
+  const okView = new DataView(new Uint8Array([FTMS_OP_RESPONSE_CODE, FTMS_OP_REQUEST_CONTROL, FTMS_RESULT_SUCCESS]).buffer);
+  const okResp = parseFtmsControlPointResponse(okView);
+  assert.ok(okResp && okResp.success && !okResp.controlNotPermitted);
+
+  const deniedView = new DataView(new Uint8Array([FTMS_OP_RESPONSE_CODE, FTMS_OP_REQUEST_CONTROL, FTMS_RESULT_CONTROL_NOT_PERMITTED]).buffer);
+  const deniedResp = parseFtmsControlPointResponse(deniedView);
+  assert.ok(deniedResp && !deniedResp.success && deniedResp.controlNotPermitted);
+  assert.equal(deniedResp.errorMessage, CONTROL_NOT_PERMITTED_MESSAGE);
+
+  // 5) WebBluetoothTrainerDevice sets ergControlActive ONLY when Request Control returns 0x01, and shows exact message on 0x05
+  let cpListener: ((ev: Event) => void) | null = null;
+  let nextControlResultCode = FTMS_RESULT_CONTROL_NOT_PERMITTED;
+
+  const mockControlChar: BleCharacteristicLike = {
+    addEventListener: (_ev, cb) => {
+      cpListener = cb;
+    },
+    removeEventListener: () => {
+      cpListener = null;
+    },
+    startNotifications: async () => mockControlChar,
+    writeValueWithResponse: async (buf) => {
+      const arr = new Uint8Array(buf instanceof ArrayBuffer ? buf : (buf as ArrayBufferView).buffer);
+      const opCode = arr[0];
+      const respBytes = new Uint8Array([FTMS_OP_RESPONSE_CODE, opCode, nextControlResultCode]);
+      const dv = new DataView(respBytes.buffer);
+      queueMicrotask(() => {
+        cpListener?.({ target: { value: dv } } as unknown as Event);
+      });
+    },
+  };
+
+  const mockBikeDataChar: BleCharacteristicLike = {
+    addEventListener: () => undefined,
+    removeEventListener: () => undefined,
+    startNotifications: async () => mockBikeDataChar,
+  };
+
+  const ftmsTrainerDevice: BleDeviceLike = {
+    id: 'mock-kickr',
+    name: 'Mock KICKR',
+    addEventListener: () => undefined,
+    removeEventListener: () => undefined,
+    gatt: {
+      connected: true,
+      connect: async () => ftmsTrainerDevice.gatt!,
+      disconnect: () => undefined,
+      getPrimaryService: async (uuid) => {
+        if (uuid === 0x1826) {
+          return {
+            getCharacteristic: async (charUuid) =>
+              charUuid === 0x2ad2 ? mockBikeDataChar : mockControlChar,
+          };
+        }
+        throw new Error('Service not found');
+      },
+    },
+  };
+
+  const trainer = new WebBluetoothTrainerDevice({ writeTimeoutMs: 250, maxRetries: 1, retryDelayMs: 5 });
+  await trainer.attachToDevice(ftmsTrainerDevice, false);
+  assert.equal(trainer.getStatus().ergControlActive, false);
+
+  // Control Not Permitted (0x05) -> ergControlActive stays false and exact user message is shown
+  const denied = await trainer.requestControl();
+  assert.equal(denied, false);
+  assert.equal(trainer.getStatus().ergControlActive, false);
+  assert.equal(trainer.getStatus().ergControlWarning, CONTROL_NOT_PERMITTED_MESSAGE);
+
+  // Success (0x01) -> ergControlActive flips true and warning clears
+  nextControlResultCode = FTMS_RESULT_SUCCESS;
+  const granted = await trainer.requestControl();
+  assert.equal(granted, true);
+  assert.equal(trainer.getStatus().ergControlActive, true);
+  assert.equal(trainer.getStatus().ergControlWarning, null);
+
+  // 6) Cycling Power (0x1818) fallback when FTMS (0x1826) is missing
+  const cpListenerHolder: { fn: ((ev: Event) => void) | null } = { fn: null };
+  const mockCyclingPowerChar: BleCharacteristicLike = {
+    addEventListener: (_ev, cb) => {
+      cpListenerHolder.fn = cb;
+    },
+    removeEventListener: () => {
+      cpListenerHolder.fn = null;
+    },
+    startNotifications: async () => mockCyclingPowerChar,
+  };
+
+  const cpOnlyDevice: BleDeviceLike = {
+    id: 'mock-stages',
+    name: 'Stages Power Meter',
+    addEventListener: () => undefined,
+    removeEventListener: () => undefined,
+    gatt: {
+      connected: true,
+      connect: async () => cpOnlyDevice.gatt!,
+      disconnect: () => undefined,
+      getPrimaryService: async (uuid) => {
+        if (uuid === 0x1818) {
+          return {
+            getCharacteristic: async () => mockCyclingPowerChar,
+          };
+        }
+        throw new Error('FTMS service missing');
+      },
+    },
+  };
+
+  const cpTrainer = new WebBluetoothTrainerDevice({ writeTimeoutMs: 250, maxRetries: 1, retryDelayMs: 5 });
+  let receivedPower = 0;
+  cpTrainer.onTelemetry((t) => {
+    receivedPower = t.instantPower;
+  });
+  await cpTrainer.attachToDevice(cpOnlyDevice, false);
+  assert.equal(cpTrainer.getPowerMode(), 'cycling-power');
+  assert.equal(cpTrainer.getStatus().status, 'connected');
+  assert.equal(cpTrainer.getStatus().ergControlActive, false);
+
+  // Emit a 275W Cycling Power packet
+  const cpPkt = new DataView(new ArrayBuffer(4));
+  cpPkt.setUint16(0, 0x0000, true);
+  cpPkt.setInt16(2, 275, true);
+  cpListenerHolder.fn?.({ target: { value: cpPkt } } as unknown as Event);
+  assert.equal(receivedPower, 275);
+});
+
+test('34. Step 4 – Zero-alloc telemetry ring buffer, wall-clock 1 Hz gap filling, unclamped WorkoutWallClock & O(1) incremental TSS', () => {
+  // 1) LiveTelemetryBuffer ring writes, arrival timestamps & 3s rolling average
+  const buf = new LiveTelemetryBuffer(3000);
+  buf.pushTrainer(200, 88, 34.2, 10_000, 'ble-trainer', false);
+  buf.pushHeartRate(142, 10_200);
+  buf.pushTrainer(260, 90, 36.1, 11_000, 'ble-trainer', false);
+  buf.pushCadence(94, 11_100);
+  // Dedicated cadence sensor overrides trainer cadence when connected
+  buf.pushTrainer(230, 82, 35.0, 12_000, 'ble-trainer', true);
+
+  assert.equal(buf.instantPower, 230);
+  assert.equal(buf.power3sAvg, 230); // avg(200, 260, 230) = 230
+  assert.equal(buf.heartRate, 142);
+  assert.equal(buf.cadence, 94);
+  assert.equal(buf.cadenceSource, 'ble-cadence');
+  assert.equal(buf.lastTrainerMs, 12_000);
+  assert.equal(buf.lastHrMs, 10_200);
+  assert.equal(buf.lastCadenceMs, 11_100);
+  assert.equal(buf.getRingCount(), 5);
+
+  const readout: TelemetryRingReadout = { power: 0, heartRate: 0, cadence: 0, speedKmh: 0, timestampMs: 0 };
+  assert.equal(buf.readLatest(0, readout), true);
+  assert.equal(readout.power, 230);
+  assert.equal(readout.timestampMs, 12_000);
+  assert.equal(buf.readLatest(4, readout), true);
+  assert.equal(readout.power, 200);
+  assert.equal(readout.timestampMs, 10_000);
+
+  // 2) RideRecorder wall-clock 1 Hz gap filling across a 5.3 s main-thread stall
+  const rec = new RideRecorder();
+  const baseTs = 1_760_000_000_000;
+  rec.beginSession('w-step4', 'Threshold Test', 250, baseTs, 0, 'Warmup');
+  const s0 = rec.recordOnWallClock({
+    timestampMs: baseTs,
+    dtSec: 1,
+    elapsedSec: 1,
+    power: 210,
+    heartRate: 138,
+    cadence: 88,
+    speedKmh: 33,
+    gradePct: 3,
+    stepIndex: 0,
+    stepLabel: 'Warmup',
+  });
+  assert.equal(s0.length, 1);
+  assert.equal(s0[0].filled, undefined);
+
+  // Simulate a 5.3-second main-thread stall before the next tick arrives
+  const stalledBatch = rec.recordOnWallClock({
+    timestampMs: baseTs + 5300,
+    dtSec: 5.3,
+    elapsedSec: 6.3,
+    power: 245,
+    heartRate: 148,
+    cadence: 92,
+    speedKmh: 36,
+    gradePct: 6,
+    stepIndex: 1,
+    stepLabel: 'Interval 1',
+  });
+
+  // 4 filled samples (+1s, +2s, +3s, +4s holding 210W) + 1 fresh live sample (+5.3s at 245W)
+  assert.equal(stalledBatch.length, 5);
+  for (let i = 0; i < 4; i++) {
+    assert.equal(stalledBatch[i].filled, true);
+    assert.equal(stalledBatch[i].power, 210);
+    assert.equal(stalledBatch[i].heartRate, 138);
+  }
+  assert.equal(stalledBatch[4].filled, undefined);
+  assert.equal(stalledBatch[4].power, 245);
+  assert.equal(rec.getFilledSampleCount(), 4);
+  assert.ok(rec.getMaxSampleGapMs() <= 1400, `Expected max gap <= 1400ms, got ${rec.getMaxSampleGapMs()}`);
+
+  // Intentional 20-second pause must NOT backfill or inflate maxSampleGapMs
+  rec.notifyPaused();
+  rec.notifyResumed();
+  const afterPause = rec.recordOnWallClock({
+    timestampMs: baseTs + 25_300,
+    dtSec: 1,
+    elapsedSec: 7.3,
+    power: 220,
+    heartRate: 130,
+    cadence: 86,
+    speedKmh: 34,
+    gradePct: 3,
+    stepIndex: 1,
+    stepLabel: 'Interval 1',
+  });
+  assert.equal(afterPause.length, 1);
+  assert.equal(afterPause[0].filled, undefined);
+  assert.ok(rec.getMaxSampleGapMs() <= 1400);
+
+  // 3) WorkoutWallClock: no 2s clamp, pause accounting, and resumeGapSec reporting
+  const clock = new WorkoutWallClock();
+  clock.load(1800, 0);
+  clock.start(100_000);
+  let p = clock.poll(101_000);
+  assert.equal(p.elapsedSec, 1);
+  assert.equal(p.resumeGapSec, 0);
+
+  // 12-second tab sleep / CPU freeze: advances full 12 s without clamping to 2 s
+  p = clock.poll(113_000);
+  assert.equal(p.elapsedSec, 13);
+  assert.equal(p.dtSec, 12);
+  assert.equal(p.resumeGapSec, 12);
+
+  // Pause for 30 seconds -> elapsed must stay frozen at 13 s when resumed
+  clock.pause(113_000);
+  clock.start(143_000);
+  p = clock.poll(145_000);
+  assert.equal(p.elapsedSec, 15);
+  assert.equal(clock.getAccumulatedPausedMs(), 30_000);
+
+  // 4) IncrementalTssTracker matches batch calculateLiveTss exactly, and RideHistoryBuffer tracks averages
+  const tssTracker = new IncrementalTssTracker();
+  const histBuf = new RideHistoryBuffer();
+  const samplePowers: number[] = [];
+
+  for (let sec = 1; sec <= 90; sec++) {
+    const w = sec <= 25 ? 160 : sec <= 60 ? 290 : 195;
+    samplePowers.push(w);
+    tssTracker.pushPower(w);
+    histBuf.push(sec, w, 140 + (sec % 15), 250, 88);
+
+    if (sec === 10 || sec === 29 || sec === 30 || sec === 60 || sec === 90) {
+      assert.equal(
+        tssTracker.getLiveTss(250),
+        calculateLiveTss(samplePowers, 250),
+        `Incremental TSS mismatch at sec=${sec}`
+      );
+    }
+  }
+
+  assert.equal(histBuf.length, 90);
+  assert.equal(histBuf.peakPower, 290);
+  assert.ok(histBuf.getAvgPower() > 200);
+  assert.ok(histBuf.getAvgHeartRate() >= 140);
+});
+
+test('35. Step 5 – Hardware quality auto-detection, ordered GraphicsGovernor degradation, longtask triggers, mid-interval upgrade lock & Low 30 fps cap', () => {
+  // 1) Auto-detection across phone, tablet, high-end desktop, and slow CPU benchmark
+  const phone = detectRecommendedQuality({
+    isTouchDevice: true,
+    screenMinDim: 390,
+    hardwareConcurrency: 4,
+    deviceMemoryGb: 4,
+    benchmarkMs: 12,
+  });
+  assert.equal(phone.quality, 'low');
+  assert.equal(phone.isCompactPhone, true);
+
+  const tablet = detectRecommendedQuality({
+    isTouchDevice: true,
+    screenMinDim: 820,
+    hardwareConcurrency: 8,
+    deviceMemoryGb: 8,
+    benchmarkMs: 8,
+  });
+  assert.equal(tablet.quality, 'medium');
+  assert.equal(tablet.isCompactPhone, false);
+
+  const desktop = detectRecommendedQuality({
+    isTouchDevice: false,
+    screenMinDim: 1080,
+    hardwareConcurrency: 12,
+    deviceMemoryGb: 16,
+    benchmarkMs: 3.5,
+  });
+  assert.equal(desktop.quality, 'high');
+
+  const throttledDesktop = detectRecommendedQuality({
+    isTouchDevice: false,
+    screenMinDim: 1440,
+    hardwareConcurrency: 8,
+    deviceMemoryGb: 16,
+    benchmarkMs: 32,
+  });
+  assert.equal(throttledDesktop.quality, 'low');
+
+  // 2) Low quality enforces 30 fps cap, DPR 1.0, and post-FX off out of the box
+  const lowCfg = getEffectiveRenderConfig('low', 0, false);
+  assert.equal(lowCfg.fpsCap, 30);
+  assert.equal(lowCfg.dprMax, 1);
+  assert.equal(lowCfg.bloom, false);
+  assert.equal(lowCfg.chromaticAberration, false);
+
+  // 3) Ordered degradation ladder: DPR -> chromaticAberration -> bloom -> scenery -> fpsCap30
+  assert.deepEqual([...DEGRADATION_ORDER], [
+    'dpr',
+    'chromaticAberration',
+    'bloom',
+    'scenery',
+    'fpsCap30',
+  ]);
+
+  const gov = new GraphicsGovernor({
+    degradeCooldownMs: 1000,
+    upgradeHoldMs: 2000,
+    longTaskWindowMs: 3000,
+    longTaskTriggerCount: 2,
+    frameBudget60Ms: 22,
+  });
+  gov.setBaseQuality('high');
+
+  let now = 10_000;
+  // Warm up EMA above 22 ms budget, then step through each degradation stage strictly in order
+  for (let w = 0; w < 6; w++) {
+    now += 40;
+    gov.recordFrame(34, now, { isMidInterval: true });
+  }
+  const observedStages: number[] = [];
+  for (let step = 1; step <= 5; step++) {
+    if (step > 1) {
+      now += 1050;
+      gov.recordFrame(34, now, { isMidInterval: true });
+    }
+    observedStages.push(gov.getStage());
+    const cfg = gov.getConfig(false);
+    if (step === 1) {
+      assert.equal(cfg.dprMax, 1.0);
+      assert.equal(cfg.chromaticAberration, true);
+      assert.equal(cfg.bloom, true);
+      assert.equal(cfg.sceneryScale, 1.0);
+      assert.equal(cfg.fpsCap, 60);
+    } else if (step === 2) {
+      assert.equal(cfg.chromaticAberration, false);
+      assert.equal(cfg.bloom, true);
+    } else if (step === 3) {
+      assert.equal(cfg.bloom, false);
+      assert.equal(cfg.sceneryScale, 1.0);
+    } else if (step === 4) {
+      assert.equal(cfg.sceneryScale, 0.5);
+      assert.equal(cfg.fpsCap, 60);
+    } else if (step === 5) {
+      assert.equal(cfg.fpsCap, 30);
+    }
+  }
+  assert.deepEqual(observedStages, [1, 2, 3, 4, 5]);
+
+  // 4) Mid-interval upgrade lock: fast frames MUST NEVER raise quality while isMidInterval is true
+  for (let f = 0; f < 80; f++) {
+    now += 100;
+    gov.recordFrame(8, now, { isMidInterval: true });
+  }
+  assert.equal(gov.getStage(), 5, 'Governor must never raise quality mid-interval');
+
+  // 5) Once idle / Z1 recovery (isMidInterval: false), sustained fast frames step back up cleanly
+  for (let f = 0; f < 40; f++) {
+    now += 100;
+    gov.recordFrame(8, now, { isMidInterval: false });
+  }
+  assert.ok(gov.getStage() < 5, `Expected governor to recover outside interval, got stage ${gov.getStage()}`);
+
+  // 6) PerformanceObserver longtask trigger steps down even when EMA frame time looks normal
+  const ltGov = new GraphicsGovernor({ degradeCooldownMs: 500, longTaskTriggerCount: 2 });
+  ltGov.setBaseQuality('high');
+  ltGov.recordLongTask(75, 50_000);
+  ltGov.recordLongTask(82, 50_200);
+  ltGov.recordFrame(15, 50_300, { isMidInterval: true });
+  assert.equal(ltGov.getStage(), 1);
+  assert.equal(ltGov.getDiagnostics().longTaskCount, 2);
+});
+
+test('36. Step 6 – GPU road shader profile uniform packing (zero alloc) and unified sky/sun/stars shader parameters', () => {
+  // 1) Profile uniform array matches ROAD_SEGMENTS + 1 and reuses exact Vector4 instances in-place
+  const profile = createRoadProfileUniformArray();
+  assert.equal(profile.length, ROAD_PROFILE_COUNT);
+  assert.equal(ROAD_PROFILE_COUNT, ROAD_SEGMENTS + 1);
+  const firstRef = profile[0];
+  const lastRef = profile[ROAD_PROFILE_COUNT - 1];
+
+  const rt = createWorldRuntime();
+  rt.distance = 245.5;
+  rt.freeRideTerrain = createFreeRideTerrain(1337);
+  rt.gpsRoute = compileGpsRoute('bike-line-art', 'Single-Line Bike', BIKE_LINE_ART_POINTS, 22000);
+  updateRoadCurveLut(rt);
+
+  packRoadProfileUniforms(rt, profile);
+
+  // Confirm zero object replacement (in-place mutation)
+  assert.equal(profile[0], firstRef);
+  assert.equal(profile[ROAD_PROFILE_COUNT - 1], lastRef);
+
+  // Every packed vec4 must match sampleRoadAtZ (x, y, slopeX, slopeY) bit-for-bit
+  const expected = { x: 0, y: 0, slopeX: 0, slopeY: 0 };
+  for (let i = 0; i < ROAD_PROFILE_COUNT; i++) {
+    sampleRoadAtZ(
+      rt.distance,
+      ROAD_SEGMENT_Z[i],
+      expected,
+      rt.elevationProfile,
+      rt.workoutElapsedSec,
+      rt.freeRideTerrain
+    );
+    assert.ok(Math.abs(profile[i].x - expected.x) < 1e-6);
+    assert.ok(Math.abs(profile[i].y - expected.y) < 1e-6);
+    assert.ok(Math.abs(profile[i].z - expected.slopeX) < 1e-6);
+    assert.ok(Math.abs(profile[i].w - expected.slopeY) < 1e-6);
+  }
+
+  // 2) Unified sky/sun/stars shader exposes distinct shader index and valid sun framing for all 4 themes
+  const themes = ['neon-city', 'palm-grove', 'cloud-horizon', 'causeway-embankment'] as const;
+  const seenIndices = new Set<number>();
+  for (const theme of themes) {
+    const p = getUnifiedSkyThemeParams(theme);
+    seenIndices.add(p.shaderIndex);
+    assert.ok(p.sunBaseElev > 0.05 && p.sunBaseElev < 0.3);
+    assert.ok(p.sunAngularRadius > 0.1 && p.sunAngularRadius < 0.4);
+    assert.ok(p.haloColorHex.startsWith('#') && p.haloColorHex.length === 7);
+  }
+  assert.equal(seenIndices.size, 4);
+});
+
+test('37. Step 7 & Final Acceptance – Strava upload auth guard + 60-minute throttled ride with forced reload recovery, <=1.5s max gap, <=250ms ERG latency & valid FIT', async () => {
+  // 1) Strava upload endpoint guard: shared-secret mode
+  const noSecretRes = verifyStravaUploadAccess({
+    providedSecret: undefined,
+    configuredSecret: 'neon-peloton-secret-42',
+    remoteAddress: '127.0.0.1',
+    hostHeader: 'localhost:3000',
+    forwardedForHeader: undefined,
+  });
+  assert.equal(noSecretRes.allowed, false);
+  assert.equal(noSecretRes.statusCode, 401);
+  assert.equal(noSecretRes.requiresSecret, true);
+
+  const wrongSecretRes = verifyStravaUploadAccess({
+    providedSecret: 'wrong-secret',
+    configuredSecret: 'neon-peloton-secret-42',
+    remoteAddress: '203.0.113.10',
+    hostHeader: 'trainer.example.com',
+    forwardedForHeader: '203.0.113.10',
+  });
+  assert.equal(wrongSecretRes.allowed, false);
+  assert.equal(wrongSecretRes.statusCode, 401);
+
+  const validSecretRes = verifyStravaUploadAccess({
+    providedSecret: 'neon-peloton-secret-42',
+    configuredSecret: 'neon-peloton-secret-42',
+    remoteAddress: '203.0.113.10',
+    hostHeader: 'trainer.example.com',
+    forwardedForHeader: '203.0.113.10',
+  });
+  assert.equal(validSecretRes.allowed, true);
+  assert.equal(validSecretRes.statusCode, 200);
+
+  // 2) Strava upload endpoint guard: localhost-only fallback when STRAVA_UPLOAD_SECRET is unset
+  const localOk = verifyStravaUploadAccess({
+    providedSecret: undefined,
+    configuredSecret: '',
+    remoteAddress: '::ffff:127.0.0.1',
+    hostHeader: 'localhost:3000',
+    forwardedForHeader: undefined,
+  });
+  assert.equal(localOk.allowed, true);
+  assert.equal(localOk.statusCode, 200);
+
+  const remoteBlocked = verifyStravaUploadAccess({
+    providedSecret: undefined,
+    configuredSecret: '',
+    remoteAddress: '198.51.100.24',
+    hostHeader: 'trainer.example.com',
+    forwardedForHeader: undefined,
+  });
+  assert.equal(remoteBlocked.allowed, false);
+  assert.equal(remoteBlocked.statusCode, 403);
+
+  const proxiedBlocked = verifyStravaUploadAccess({
+    providedSecret: undefined,
+    configuredSecret: '',
+    remoteAddress: '127.0.0.1',
+    hostHeader: 'localhost:3000',
+    forwardedForHeader: '203.0.113.99, 127.0.0.1',
+  });
+  assert.equal(proxiedBlocked.allowed, false);
+  assert.equal(proxiedBlocked.statusCode, 403);
+
+  // 3) Full 60-minute (3600 s) acceptance ride under 4x CPU throttle stalls & mid-ride tab reload
+  const ftp = 260;
+  const stepDurationSec = 300; // 12 x 5-min steps = 3600 s
+  const stepTargets = [
+    { label: 'Warmup Z2', pct: 0.65 },
+    { label: 'Tempo Z3', pct: 0.82 },
+    { label: 'Threshold Z4', pct: 0.98 },
+    { label: 'Recovery Z1', pct: 0.5 },
+    { label: 'VO2 Max Z5', pct: 1.12 },
+    { label: 'Recovery Z1', pct: 0.5 },
+    { label: 'Threshold Z4', pct: 1.0 },
+    { label: 'Tempo Z3', pct: 0.84 },
+    { label: 'VO2 Max Z5', pct: 1.15 },
+    { label: 'Recovery Z1', pct: 0.52 },
+    { label: 'Threshold Z4', pct: 0.96 },
+    { label: 'Cooldown Z1', pct: 0.48 },
+  ];
+
+  const t0 = Date.UTC(2026, 10, 28, 8, 0, 0);
+  const clock = new WorkoutWallClock();
+  clock.load(3600, 0);
+  clock.start(t0);
+
+  const telemetry = new LiveTelemetryBuffer(3000);
+  const ergQueue = new CoalescingErgQueue({ writeTimeoutMs: 250, maxRetries: 2, retryDelayMs: 5 });
+  const governor = new GraphicsGovernor({
+    degradeCooldownMs: 1000,
+    upgradeHoldMs: 5000,
+    frameBudget60Ms: 22,
+    longTaskTriggerCount: 2,
+  });
+  governor.setBaseQuality('high');
+
+  let recorder = new RideRecorder();
+  recorder.beginSession('accept-60m', '60m Acceptance Block', ftp, t0, 0, stepTargets[0].label, {
+    activityName: '60m Acceptance Block - Neon City',
+    sceneryName: 'Neon City',
+    sessionId: 'sess-accept-60m',
+  });
+
+  type DeltaPayload = NonNullable<ReturnType<RideRecorder['extractCheckpointDelta']>>;
+  const chunks: NonNullable<DeltaPayload['chunk']>[] = [];
+  let latestMeta: DeltaPayload['meta'] | null = null;
+  let lastStepIndex = -1;
+  let maxErgLatencyMs = 0;
+  let ergWritesCount = 0;
+  let reloadedOnce = false;
+
+  // Simulate wall-clock ticks across 3600 s, injecting 4 s main-thread stalls every 120 s
+  let elapsedSimSec = 0;
+  while (elapsedSimSec < 3600) {
+    const isStall = elapsedSimSec > 0 && elapsedSimSec % 120 === 0;
+    const tickJumpSec = isStall ? 4 : 1;
+    elapsedSimSec = Math.min(3600, elapsedSimSec + tickJumpSec);
+    const nowMs = t0 + elapsedSimSec * 1000;
+
+    const polled = clock.poll(nowMs);
+    const stepIndex = Math.min(stepTargets.length - 1, Math.floor((polled.elapsedSec - 1) / stepDurationSec));
+    const step = stepTargets[Math.max(0, stepIndex)];
+    const targetWatts = Math.round(ftp * step.pct);
+
+    // Feed BLE telemetry into zero-alloc ring buffer
+    telemetry.pushTrainer(targetWatts, 90, powerToSpeedKmh(targetWatts), nowMs, 'ble-trainer', false);
+    telemetry.pushHeartRate(130 + Math.round(step.pct * 35), nowMs);
+
+    // Trigger ERG write on every step transition and verify <= 250 ms latency
+    if (stepIndex !== lastStepIndex) {
+      lastStepIndex = stepIndex;
+      const writeStart = performance.now();
+      await ergQueue.enqueueTargetPower(targetWatts, async () => {
+        // Fast async BLE write acknowledgement (~1 ms)
+        await Promise.resolve();
+      });
+      const writeLatencyMs = performance.now() - writeStart;
+      if (writeLatencyMs > maxErgLatencyMs) maxErgLatencyMs = writeLatencyMs;
+      ergWritesCount += 1;
+    }
+
+    // Feed 4x CPU throttle pressure to the GraphicsGovernor
+    if (isStall) {
+      governor.recordLongTask(85, nowMs);
+      governor.recordLongTask(92, nowMs + 50);
+    }
+    governor.recordFrame(isStall ? 68 : 36, nowMs, { isMidInterval: step.pct >= 0.8 });
+
+    // Sample recorder on wall-clock seconds (automatically backfills 4 s stalls at 1 Hz)
+    recorder.recordOnWallClock({
+      timestampMs: nowMs,
+      dtSec: polled.dtSec,
+      elapsedSec: polled.elapsedSec,
+      power: telemetry.instantPower,
+      heartRate: telemetry.heartRate,
+      cadence: telemetry.cadence,
+      speedKmh: telemetry.speedKmh,
+      gradePct: step.pct >= 1.0 ? 7 : 2,
+      stepIndex,
+      stepLabel: step.label,
+    });
+
+    // Periodic append-only IndexedDB checkpoint every ~7 s
+    if (recorder.shouldCheckpoint(nowMs, CHECKPOINT_INTERVAL_MS)) {
+      const delta = recorder.extractCheckpointDelta({
+        rideMode: 'workout',
+        sceneryTheme: 'neon-city',
+        visitedSceneries: ['neon-city'],
+        elapsedSec: polled.elapsedSec,
+        freeRideZone: 2,
+        freeRideOffsetWatts: 0,
+        nowMs,
+      });
+      if (delta?.chunk) {
+        chunks.push(delta.chunk);
+        latestMeta = delta.meta;
+      }
+    }
+
+    // Simulate forced browser tab reload at the 30-minute mark (t = 1805 s)
+    if (!reloadedOnce && elapsedSimSec >= 1805) {
+      reloadedOnce = true;
+      assert.ok(
+        recorder.getMaxSampleGapMs() <= 1500,
+        `Expected pre-reload max sample gap <= 1500 ms, got ${recorder.getMaxSampleGapMs()} ms`
+      );
+      // Flush final pre-crash delta just before forced reload (simulating pagehide/checkpoint)
+      const preReloadDelta = recorder.extractCheckpointDelta({
+        rideMode: 'workout',
+        sceneryTheme: 'neon-city',
+        visitedSceneries: ['neon-city'],
+        elapsedSec: polled.elapsedSec,
+        freeRideZone: 2,
+        freeRideOffsetWatts: 0,
+        nowMs,
+      });
+      if (preReloadDelta?.chunk) {
+        chunks.push(preReloadDelta.chunk);
+        latestMeta = preReloadDelta.meta;
+      }
+
+      assert.ok(latestMeta, 'Expected checkpoint metadata before forced reload');
+      const recovered = assembleRecoveryFromChunks(latestMeta, chunks);
+      const freshRecorder = new RideRecorder();
+      freshRecorder.restoreFromRecovery(recovered, null);
+      recorder = freshRecorder;
+    }
+  }
+
+  assert.ok(
+    recorder.getMaxSampleGapMs() <= 1500,
+    `Expected post-reload max sample gap <= 1500 ms, got ${recorder.getMaxSampleGapMs()} ms`
+  );
+
+  const finalRide = recorder.finalize(t0 + 3600 * 1000);
+  assert.ok(finalRide, 'Final 60-minute ride should finalize cleanly');
+  assert.ok(finalRide.records.length >= 3590, `Expected ~3600 1 Hz records, got ${finalRide.records.length}`);
+  assert.equal(finalRide.laps.length, 12, 'All 12 workout steps should be preserved as laps across reload');
+
+  // Verify no recorded gap > 1.5 s across the entire 60-minute ride
+  let maxRecordedGapMs = 0;
+  for (let i = 1; i < finalRide.records.length; i++) {
+    const gap = finalRide.records[i].timestampMs - finalRide.records[i - 1].timestampMs;
+    if (gap > maxRecordedGapMs) maxRecordedGapMs = gap;
+  }
+  assert.ok(
+    maxRecordedGapMs <= 1500,
+    `Expected max recorded gap <= 1500 ms across 60-min ride, got ${maxRecordedGapMs} ms`
+  );
+
+  // Verify every step change wrote ERG within 250 ms
+  assert.equal(ergWritesCount, 12);
+  assert.ok(maxErgLatencyMs <= 250, `Expected ERG write latency <= 250 ms, got ${maxErgLatencyMs.toFixed(2)} ms`);
+
+  // Verify GraphicsGovernor lowered quality under 4x CPU throttle without affecting ride integrity
+  assert.ok(
+    governor.getStage() >= 3,
+    `Expected GraphicsGovernor to degrade >= stage 3 under 4x throttle, got stage ${governor.getStage()}`
+  );
+
+  // Verify valid Garmin .FIT binary export after reload recovery
+  const fitBytes = encodeRideToFit(finalRide);
+  const fitVerification = verifyFitBinary(fitBytes);
+  assert.equal(fitVerification.validHeaderSignature, true);
+  assert.equal(fitVerification.headerCrcValid, true);
+  assert.equal(fitVerification.fileCrcValid, true);
+  assert.equal(fitVerification.messageCountsByGlobalNum[19], 12);
+  assert.equal(fitVerification.messageCountsByGlobalNum[20], finalRide.records.length);
+});
+
+
+
+
+
+
 
 
 

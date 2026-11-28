@@ -427,10 +427,11 @@ export function FinishSign({ runtimeRef, totalDurationSec, estimatedTss }: Finis
     // Re-render 7-segment display only when integer countdown second or crossed state changes
     const crossed = remainingSec <= 0.05;
     const displaySec = Math.max(0, Math.ceil(remainingSec));
-    const key = `${displaySec}:${crossed ? 1 : 0}:${estimatedTss}`;
+    const displayTss = Math.round(rt.liveTss) || estimatedTss;
+    const key = `${displaySec}:${crossed ? 1 : 0}:${displayTss}`;
     if (key !== lastRenderedKeyRef.current) {
       lastRenderedKeyRef.current = key;
-      renderFinishSignCanvas(signCanvas, displaySec, duration, estimatedTss, crossed);
+      renderFinishSignCanvas(signCanvas, displaySec, duration, displayTss, crossed);
       signTex.needsUpdate = true;
     }
   });

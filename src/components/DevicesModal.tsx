@@ -1,8 +1,14 @@
 import { useMemo } from 'react';
-import { Bluetooth, Gauge, Heart, Radio, Signal, X, Zap } from 'lucide-react';
-import { CadenceSource } from '../devices/types';
+import { Bluetooth, Gauge, Heart, Radio, RefreshCw, Signal, Trash2, X, Zap } from 'lucide-react';
+import { CadenceSource, DeviceConnectionStatus } from '../devices/types';
 import { useAppStore } from '../store/useAppStore';
 import { getBrowserCompatibility } from '../utils/browserCheck';
+
+function statusBadgeClass(status: DeviceConnectionStatus): string {
+  if (status === 'connected') return 'text-emerald-300';
+  if (status === 'reconnecting' || status === 'connecting') return 'text-cyan-300 animate-pulse';
+  return 'text-amber-300';
+}
 
 function SignalBars({ strength }: { strength: number }) {
   const activeBars = strength >= 80 ? 4 : strength >= 55 ? 3 : strength >= 25 ? 2 : strength > 0 ? 1 : 0;
@@ -35,6 +41,9 @@ export function DevicesModal() {
   const trainerStatus = useAppStore((s) => s.trainerStatus);
   const hrStatus = useAppStore((s) => s.hrStatus);
   const cadenceStatus = useAppStore((s) => s.cadenceStatus);
+  const savedDevices = useAppStore((s) => s.savedDevices);
+  const silentReconnectAvailable = useAppStore((s) => s.silentReconnectAvailable);
+  const reconnectingLastDevices = useAppStore((s) => s.reconnectingLastDevices);
   const cadenceSource = useAppStore((s) => s.cadenceSource);
   const instantPower = useAppStore((s) => s.instantPower);
   const cadence = useAppStore((s) => s.cadence);
@@ -48,6 +57,8 @@ export function DevicesModal() {
   const disconnectHeartRate = useAppStore((s) => s.disconnectHeartRate);
   const connectBleCadence = useAppStore((s) => s.connectBleCadence);
   const disconnectCadence = useAppStore((s) => s.disconnectCadence);
+  const reconnectLastDevices = useAppStore((s) => s.reconnectLastDevices);
+  const forgetSavedDevice = useAppStore((s) => s.forgetSavedDevice);
 
   const compat = useMemo(() => getBrowserCompatibility(), []);
 
@@ -108,6 +119,60 @@ export function DevicesModal() {
             </button>
           </div>
 
+          {/* Remembered Bluetooth Devices & Reconnect Last Devices */}
+          {savedDevices.length > 0 && (
+            <div
+              className="rounded-lg p-4 bg-[#0c0924] border border-cyan-400/50 space-y-3"
+              data-testid="saved-devices-panel"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <div className="text-xs font-bold tracking-[0.14em] text-cyan-300 uppercase">
+                    Remembered Bluetooth Devices
+                  </div>
+                  <p className="text-xs text-slate-400 mt-0.5">
+                    {silentReconnectAvailable
+                      ? 'Silent auto-reconnect is enabled on startup via Web Bluetooth getDevices().'
+                      : 'Silent reconnect is unavailable in this browser — click below to reconnect your last sensors.'}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  disabled={reconnectingLastDevices || !compat.hasWebBluetoothApi}
+                  onClick={() => void reconnectLastDevices()}
+                  className="min-h-[42px] px-4 rounded-md bg-cyan-500/25 border border-cyan-400 text-cyan-100 text-xs font-bold uppercase tracking-wider hover:bg-cyan-500/35 disabled:opacity-45 flex items-center gap-1.5 whitespace-nowrap"
+                  data-testid="btn-reconnect-last-devices"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${reconnectingLastDevices ? 'animate-spin' : ''}`} />
+                  {reconnectingLastDevices ? 'Reconnecting…' : 'Reconnect Last Devices'}
+                </button>
+              </div>
+              <div className="space-y-1.5">
+                {savedDevices.map((dev) => (
+                  <div
+                    key={dev.id}
+                    className="flex items-center justify-between gap-2 rounded bg-[#070516] px-3 py-2 text-xs"
+                  >
+                    <div className="min-w-0">
+                      <span className="font-semibold text-white">{dev.name}</span>
+                      <span className="ml-2 text-[11px] uppercase text-cyan-300/90">
+                        {dev.role ?? 'sensor'}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => forgetSavedDevice(dev.id)}
+                      className="p-1.5 rounded text-slate-400 hover:text-rose-300 hover:bg-rose-500/15 transition-colors"
+                      aria-label={`Forget ${dev.name}`}
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           {/* Dedicated Bluetooth Cadence Sensor + Model Cadence Matching Card */}
           <div
             className="rounded-lg p-4 bg-[#0a0820] border border-emerald-400/45 space-y-3"
@@ -125,7 +190,7 @@ export function DevicesModal() {
                 <div className="text-xs text-slate-300 mt-0.5 flex flex-wrap items-center gap-2">
                   <span>
                     Status:{' '}
-                    <strong className={cadenceStatus.status === 'connected' ? 'text-emerald-300' : 'text-amber-300'}>
+                    <strong className={statusBadgeClass(cadenceStatus.status)}>
                       {cadenceStatus.status.toUpperCase()}
                     </strong>
                   </span>
@@ -210,7 +275,7 @@ export function DevicesModal() {
                 <div className="text-xs text-slate-300 mt-0.5 flex items-center gap-2">
                   <span>
                     Status:{' '}
-                    <strong className={trainerStatus.status === 'connected' ? 'text-emerald-300' : 'text-amber-300'}>
+                    <strong className={statusBadgeClass(trainerStatus.status)}>
                       {trainerStatus.status.toUpperCase()}
                     </strong>
                   </span>
@@ -294,7 +359,7 @@ export function DevicesModal() {
                 </div>
                 <div className="text-xs text-slate-300 mt-0.5">
                   Status:{' '}
-                  <strong className={hrStatus.status === 'connected' ? 'text-emerald-300' : 'text-amber-300'}>
+                  <strong className={statusBadgeClass(hrStatus.status)}>
                     {hrStatus.status.toUpperCase()}
                   </strong>
                 </div>
@@ -331,6 +396,15 @@ export function DevicesModal() {
                 )}
               </div>
             </div>
+
+            {hrStatus.errorMessage && (
+              <div
+                className="rounded border border-amber-400/60 bg-amber-950/50 px-3 py-2 text-xs text-amber-200"
+                data-testid="hrm-error-message"
+              >
+                {hrStatus.errorMessage}
+              </div>
+            )}
 
             <div className="rounded bg-[#070516] p-2.5 flex items-center justify-between border-t border-pink-500/20">
               <span className="text-xs text-slate-400 uppercase font-semibold">Live Heart Rate</span>

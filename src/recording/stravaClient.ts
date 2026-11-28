@@ -13,6 +13,7 @@ export interface StravaStatusResponse {
   canOAuth: boolean;
   hasRefreshToken: boolean;
   athleteName: string | null;
+  requiresUploadSecret?: boolean;
 }
 
 export interface StravaUploadResult {
@@ -22,6 +23,7 @@ export interface StravaUploadResult {
   status?: string;
   error?: string;
   needsSetup?: boolean;
+  requiresSecret?: boolean;
   duplicate?: boolean;
 }
 
@@ -70,6 +72,7 @@ export async function fetchStravaStatus(): Promise<StravaStatusResponse> {
       canOAuth: Boolean(data.canOAuth),
       hasRefreshToken: Boolean(data.hasRefreshToken),
       athleteName: typeof data.athleteName === 'string' ? data.athleteName : null,
+      requiresUploadSecret: Boolean(data.requiresUploadSecret),
     };
   } catch {
     return {
@@ -119,7 +122,10 @@ export async function openStravaOAuthPopup(): Promise<{ ok: boolean; error?: str
   }
 }
 
-export async function uploadRideToStrava(ride: SavedRide): Promise<StravaUploadResult> {
+export async function uploadRideToStrava(
+  ride: SavedRide,
+  uploadSecret?: string
+): Promise<StravaUploadResult> {
   try {
     const fitBytes = encodeRideToFit(ride);
     const fitBase64 = uint8ToBase64(fitBytes);
@@ -132,12 +138,18 @@ export async function uploadRideToStrava(ride: SavedRide): Promise<StravaUploadR
       ride.avgPower > 0 ? `Avg Power: ${ride.avgPower} W` : null,
     ].filter(Boolean);
 
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'X-Requested-With': 'EndlessHorizonCycling',
+    };
+    const trimmedSecret = uploadSecret?.trim();
+    if (trimmedSecret) {
+      headers['X-Upload-Secret'] = trimmedSecret;
+    }
+
     const res = await fetch('/api/strava/upload', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Requested-With': 'EndlessHorizonCycling',
-      },
+      headers,
       body: JSON.stringify({
         rideId: ride.id,
         fileName,
@@ -163,6 +175,7 @@ export async function uploadRideToStrava(ride: SavedRide): Promise<StravaUploadR
         ok: false,
         error: data.error || `Strava upload failed (${res.status}).`,
         needsSetup: Boolean(data.needsSetup),
+        requiresSecret: Boolean(data.requiresSecret),
         duplicate: Boolean(data.duplicate),
       };
     }

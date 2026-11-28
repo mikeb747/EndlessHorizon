@@ -1,43 +1,28 @@
 /**
  * Stateful ride telemetry recorder that captures 1 Hz Bluetooth/simulated device
  * streams (heart rate, power, cadence, speed), integrates virtual distance & altitude
- * from workout zone gradients, tracks start/end wall-clock timestamps, and records
- * automatic Laps at every workout step transition.
+ * from workout zone gradients, tracks start/end wall-clock timestamps, records
+ * automatic Laps at every workout step transition, and emits append-only IndexedDB
+ * checkpoint deltas every 5–10 seconds so rides survive reloads or crashes.
  */
 
 import { calculateCaloriesFromKj, calculateLiveTss } from '../core/workoutEngine';
 import { CompiledGpsRoute, sampleCompiledRouteGps } from './gpsRoutes';
 import {
+  ActiveLapSnapshot,
+  ActiveRideChunk,
+  ActiveRideMeta,
   FIT_SPORT_CYCLING,
   FIT_SUB_SPORT_VIRTUAL_ACTIVITY,
   RecordedLap,
   RecordedSample,
   SavedRide,
+  SceneryDisplayId,
+  UnfinishedRideRecovery,
 } from './types';
 import { VIRTUAL_START_ALTITUDE_M } from './virtualGps';
 
-interface ActiveLapAccumulator {
-  lapIndex: number;
-  stepIndex: number;
-  stepLabel: string;
-  startTimeMs: number;
-  startDistanceM: number;
-  timerSec: number;
-  ascentM: number;
-  descentM: number;
-  workKj: number;
-  sampleCount: number;
-  powerSum: number;
-  maxPower: number;
-  hrSum: number;
-  hrCount: number;
-  maxHr: number;
-  cadenceSum: number;
-  cadenceCount: number;
-  maxCadence: number;
-  speedSum: number;
-  maxSpeed: number;
-}
+export const CHECKPOINT_INTERVAL_MS = 7000; // 7 s (within 5–10 s target)
 
 export interface RecordTickInput {
   timestampMs: number;
@@ -50,14 +35,32 @@ export interface RecordTickInput {
   gradePct: number;
   stepIndex: number;
   stepLabel: string;
+  filled?: boolean;
+}
+
+export interface CheckpointContext {
+  rideMode: 'workout' | 'freeride';
+  sceneryTheme: SceneryDisplayId;
+  visitedSceneries: SceneryDisplayId[];
+  elapsedSec: number;
+  freeRideZone: number;
+  freeRideOffsetWatts: number;
+  nowMs?: number;
+}
+
+export interface CheckpointPayload {
+  meta: ActiveRideMeta;
+  chunk: ActiveRideChunk | null;
 }
 
 export class RideRecorder {
+  private sessionId = '';
   private workoutId = '';
   private workoutName = '';
   private activityName = '';
   private sceneryName = '';
   private gpsRoute: CompiledGpsRoute | null = null;
+  private gpsRouteNameFallback = 'Ura-shima Loop';
   private ftp = 250;
   private startTimeMs: number | null = null;
   private totalTimerSec = 0;
@@ -69,13 +72,38 @@ export class RideRecorder {
 
   private records: RecordedSample[] = [];
   private laps: RecordedLap[] = [];
-  private activeLap: ActiveLapAccumulator | null = null;
+  private activeLap: ActiveLapSnapshot | null = null;
+
+  // Append-only checkpoint cursors
+  private lastCheckpointedSampleIdx = 0;
+  private lastCheckpointedLapIdx = 0;
+  private nextChunkSeq = 0;
+  private lastCheckpointWallMs = 0;
+
+  // Live gap diagnostics & wall-clock 1 Hz gap-filling state
+  private lastRecordedTimestampMs = 0;
+  private maxSampleGapMs = 0;
+  private filledSampleCount = 0;
+  private nextWallSampleMs: number | null = null;
+  private isPausedGap = false;
+  private lastTelemetry: {
+    power: number;
+    heartRate: number;
+    cadence: number;
+    speedKmh: number;
+    gradePct: number;
+    stepIndex: number;
+    stepLabel: string;
+    elapsedSec: number;
+  } | null = null;
 
   public reset(): void {
+    this.sessionId = '';
     this.startTimeMs = null;
     this.activityName = '';
     this.sceneryName = '';
     this.gpsRoute = null;
+    this.gpsRouteNameFallback = 'Ura-shima Loop';
     this.totalTimerSec = 0;
     this.distanceM = 0;
     this.altitudeM = VIRTUAL_START_ALTITUDE_M;
@@ -85,6 +113,16 @@ export class RideRecorder {
     this.records = [];
     this.laps = [];
     this.activeLap = null;
+    this.lastCheckpointedSampleIdx = 0;
+    this.lastCheckpointedLapIdx = 0;
+    this.nextChunkSeq = 0;
+    this.lastCheckpointWallMs = 0;
+    this.lastRecordedTimestampMs = 0;
+    this.maxSampleGapMs = 0;
+    this.filledSampleCount = 0;
+    this.nextWallSampleMs = null;
+    this.isPausedGap = false;
+    this.lastTelemetry = null;
   }
 
   public beginSession(
@@ -98,17 +136,79 @@ export class RideRecorder {
       activityName?: string;
       sceneryName?: string;
       gpsRoute?: CompiledGpsRoute | null;
+      sessionId?: string;
     }
   ): void {
     if (this.startTimeMs !== null) return;
+    this.sessionId =
+      options?.sessionId || `sess-${startTimeMs}-${Math.random().toString(36).slice(2, 7)}`;
     this.workoutId = workoutId;
     this.workoutName = workoutName;
     this.activityName = options?.activityName || workoutName;
     this.sceneryName = options?.sceneryName || '';
     this.gpsRoute = options?.gpsRoute ?? null;
+    this.gpsRouteNameFallback = options?.gpsRoute?.name ?? 'Ura-shima Loop';
     this.ftp = ftp;
     this.startTimeMs = startTimeMs;
+    this.lastCheckpointWallMs = startTimeMs;
+    this.lastRecordedTimestampMs = 0;
+    this.maxSampleGapMs = 0;
     this.activeLap = this.createLapAccumulator(0, initialStepIndex, initialStepLabel, startTimeMs);
+  }
+
+  /**
+   * Restore full recorder state from an unfinished IndexedDB recovery payload so
+   * the rider can seamlessly resume recording or immediately finalize into a SavedRide.
+   */
+  public restoreFromRecovery(
+    recovery: UnfinishedRideRecovery,
+    gpsRoute: CompiledGpsRoute | null = null
+  ): void {
+    this.reset();
+    const { meta, samples, laps } = recovery;
+    this.sessionId = meta.sessionId;
+    this.workoutId = meta.workoutId;
+    this.workoutName = meta.workoutName;
+    this.activityName = meta.activityName || meta.workoutName;
+    this.sceneryName = meta.sceneryName || '';
+    this.gpsRoute = gpsRoute;
+    this.gpsRouteNameFallback = gpsRoute?.name ?? meta.gpsRouteName ?? 'Ura-shima Loop';
+    this.ftp = meta.ftp;
+    this.startTimeMs = meta.startTimeMs;
+    this.totalTimerSec = meta.totalTimerSec;
+    this.distanceM = meta.distanceM;
+    this.altitudeM = meta.altitudeM;
+    this.totalAscentM = meta.totalAscentM;
+    this.totalDescentM = meta.totalDescentM;
+    this.totalWorkKj = meta.totalWorkKj;
+    this.records = samples.map((s) => ({ ...s }));
+    this.laps = laps.map((l) => ({ ...l }));
+    this.activeLap = meta.activeLap ? { ...meta.activeLap } : null;
+    this.lastCheckpointedSampleIdx = this.records.length;
+    this.lastCheckpointedLapIdx = this.laps.length;
+    this.nextChunkSeq = Math.max(meta.nextChunkSeq, recovery.chunks.length);
+    this.lastCheckpointWallMs = Date.now();
+    const lastSample = this.records[this.records.length - 1];
+    this.lastRecordedTimestampMs = lastSample ? lastSample.timestampMs : 0;
+    this.filledSampleCount = this.records.reduce((n, s) => n + (s.filled ? 1 : 0), 0);
+    this.nextWallSampleMs = null;
+    this.isPausedGap = true;
+    this.lastTelemetry = lastSample
+      ? {
+          power: lastSample.power,
+          heartRate: lastSample.heartRate,
+          cadence: lastSample.cadence,
+          speedKmh: lastSample.speedMps * 3.6,
+          gradePct: lastSample.gradePct,
+          stepIndex: lastSample.stepIndex,
+          stepLabel: this.activeLap?.stepLabel ?? 'Resumed',
+          elapsedSec: lastSample.elapsedSec,
+        }
+      : null;
+  }
+
+  public getSessionId(): string {
+    return this.sessionId;
   }
 
   public updateMeta(ftp: number, activityName?: string, sceneryName?: string): void {
@@ -119,6 +219,7 @@ export class RideRecorder {
 
   public setGpsRoute(route: CompiledGpsRoute | null): void {
     this.gpsRoute = route;
+    if (route) this.gpsRouteNameFallback = route.name;
   }
 
   public getStartTimeMs(): number | null {
@@ -137,12 +238,121 @@ export class RideRecorder {
     return this.totalAscentM;
   }
 
+  public getTotalWorkKj(): number {
+    return this.totalWorkKj;
+  }
+
+  public getTotalTimerSec(): number {
+    return this.totalTimerSec;
+  }
+
   public getLapCount(): number {
     return this.laps.length + (this.activeLap ? 1 : 0);
   }
 
   public getRecordCount(): number {
     return this.records.length;
+  }
+
+  public getMaxSampleGapMs(): number {
+    return this.maxSampleGapMs;
+  }
+
+  public getLastRecordedTimestampMs(): number {
+    return this.lastRecordedTimestampMs;
+  }
+
+  public getFilledSampleCount(): number {
+    return this.filledSampleCount;
+  }
+
+  /**
+   * Mark an intentional pause so the paused wall-clock duration is NOT backfilled
+   * with synthetic samples or counted as a recording stall gap upon resume.
+   */
+  public notifyPaused(): void {
+    this.isPausedGap = true;
+    this.nextWallSampleMs = null;
+  }
+
+  public notifyResumed(): void {
+    this.isPausedGap = true;
+    this.nextWallSampleMs = null;
+  }
+
+  /**
+   * Returns true when enough wall-clock time (default 7 s) has elapsed since the
+   * last checkpoint and there is new telemetry or lap data to persist.
+   */
+  public shouldCheckpoint(nowMs = Date.now(), intervalMs = CHECKPOINT_INTERVAL_MS): boolean {
+    if (this.startTimeMs === null) return false;
+    const hasPending =
+      this.records.length > this.lastCheckpointedSampleIdx ||
+      this.laps.length > this.lastCheckpointedLapIdx;
+    if (!hasPending) return false;
+    return nowMs - this.lastCheckpointWallMs >= intervalMs;
+  }
+
+  /**
+   * Extract an append-only delta chunk (only samples & closed laps added since the
+   * previous checkpoint) plus updated compact session metadata.
+   */
+  public extractCheckpointDelta(ctx: CheckpointContext, force = false): CheckpointPayload | null {
+    if (this.startTimeMs === null) return null;
+    const nowMs = ctx.nowMs ?? Date.now();
+    const newSamples = this.records.slice(this.lastCheckpointedSampleIdx);
+    const newLaps = this.laps.slice(this.lastCheckpointedLapIdx);
+
+    if (!force && newSamples.length === 0 && newLaps.length === 0) {
+      return null;
+    }
+
+    let chunk: ActiveRideChunk | null = null;
+    if (newSamples.length > 0 || newLaps.length > 0) {
+      const seq = this.nextChunkSeq++;
+      chunk = {
+        id: `${this.sessionId}:chunk:${seq}`,
+        sessionId: this.sessionId,
+        seq,
+        createdAtMs: nowMs,
+        samples: newSamples,
+        closedLaps: newLaps,
+      };
+      this.lastCheckpointedSampleIdx = this.records.length;
+      this.lastCheckpointedLapIdx = this.laps.length;
+    }
+
+    this.lastCheckpointWallMs = nowMs;
+
+    const meta: ActiveRideMeta = {
+      sessionId: this.sessionId,
+      rideMode: ctx.rideMode,
+      workoutId: this.workoutId,
+      workoutName: this.workoutName,
+      activityName: this.activityName || this.workoutName,
+      sceneryName: this.sceneryName,
+      sceneryTheme: ctx.sceneryTheme,
+      visitedSceneries: [...ctx.visitedSceneries],
+      gpsRouteName: this.gpsRoute?.name ?? this.gpsRouteNameFallback,
+      ftp: this.ftp,
+      startTimeMs: this.startTimeMs,
+      lastUpdatedMs: nowMs,
+      elapsedSec: ctx.elapsedSec,
+      totalTimerSec: this.totalTimerSec,
+      distanceM: this.distanceM,
+      altitudeM: this.altitudeM,
+      totalAscentM: this.totalAscentM,
+      totalDescentM: this.totalDescentM,
+      totalWorkKj: this.totalWorkKj,
+      freeRideZone: ctx.freeRideZone,
+      freeRideOffsetWatts: ctx.freeRideOffsetWatts,
+      activeLap: this.activeLap ? { ...this.activeLap } : null,
+      nextChunkSeq: this.nextChunkSeq,
+      sampleCount: this.records.length,
+      closedLapCount: this.laps.length,
+    };
+
+    return { meta, chunk };
   }
 
   /**
@@ -183,7 +393,7 @@ export class RideRecorder {
     if (this.startTimeMs === null) {
       this.beginSession(
         this.workoutId || 'custom',
-        this.workoutName || 'NeonVelo Ride',
+        this.workoutName || 'Endless Horizon Ride',
         this.ftp,
         input.timestampMs,
         input.stepIndex,
@@ -194,6 +404,18 @@ export class RideRecorder {
     // Automatically split a new lap whenever stepIndex transitions
     if (this.activeLap && this.activeLap.stepIndex !== input.stepIndex) {
       this.markStepChange(input.stepIndex, input.stepLabel, input.timestampMs);
+    }
+
+    if (this.lastRecordedTimestampMs > 0 && !this.isPausedGap) {
+      const gap = input.timestampMs - this.lastRecordedTimestampMs;
+      if (gap > this.maxSampleGapMs) {
+        this.maxSampleGapMs = gap;
+      }
+    }
+    this.isPausedGap = false;
+    this.lastRecordedTimestampMs = input.timestampMs;
+    if (input.filled) {
+      this.filledSampleCount += 1;
     }
 
     const dt = Math.max(0, input.dtSec);
@@ -228,6 +450,7 @@ export class RideRecorder {
       latDeg: gps.latDeg,
       lonDeg: gps.lonDeg,
       stepIndex: input.stepIndex,
+      ...(input.filled ? { filled: true } : {}),
     };
 
     this.records.push(sample);
@@ -255,7 +478,96 @@ export class RideRecorder {
       if (sample.speedMps > lap.maxSpeed) lap.maxSpeed = sample.speedMps;
     }
 
+    this.lastTelemetry = {
+      power: sample.power,
+      heartRate: sample.heartRate,
+      cadence: sample.cadence,
+      speedKmh: input.speedKmh,
+      gradePct: input.gradePct,
+      stepIndex: input.stepIndex,
+      stepLabel: input.stepLabel,
+      elapsedSec: input.elapsedSec,
+    };
+
     return sample;
+  }
+
+  /**
+   * Wall-clock 1 Hz sampler that explicitly fills missed seconds (holding the last
+   * known telemetry values with `filled: true`) whenever the main thread stalls,
+   * guaranteeing continuous 1 Hz records with max gap <= 1.4 s.
+   */
+  public recordOnWallClock(input: RecordTickInput): RecordedSample[] {
+    const emitted: RecordedSample[] = [];
+    const nowMs = input.timestampMs;
+
+    if (this.startTimeMs === null) {
+      this.beginSession(
+        this.workoutId || 'custom',
+        this.workoutName || 'Endless Horizon Ride',
+        this.ftp,
+        nowMs,
+        input.stepIndex,
+        input.stepLabel
+      );
+    }
+
+    // First sample of session or first sample after an intentional pause/resume
+    if (this.nextWallSampleMs === null || this.isPausedGap || this.lastRecordedTimestampMs === 0) {
+      const s = this.recordSample({ ...input, filled: false });
+      emitted.push(s);
+      this.nextWallSampleMs = nowMs + 1000;
+      return emitted;
+    }
+
+    // Backfill any missed wall-clock seconds while holding last known values
+    const MAX_FILL_PER_CALL = 600;
+    let filledCount = 0;
+    let remainingDt = Math.max(0, input.dtSec);
+    const held = this.lastTelemetry;
+
+    while (
+      held &&
+      this.nextWallSampleMs <= nowMs - 400 &&
+      filledCount < MAX_FILL_PER_CALL
+    ) {
+      const fillTs = this.nextWallSampleMs;
+      const fillDt = 1.0;
+      remainingDt = Math.max(0, remainingDt - fillDt);
+      const fillElapsed = Math.min(input.elapsedSec, held.elapsedSec + fillDt);
+      const filledSample = this.recordSample({
+        timestampMs: fillTs,
+        dtSec: fillDt,
+        elapsedSec: fillElapsed,
+        power: held.power,
+        heartRate: held.heartRate,
+        cadence: held.cadence,
+        speedKmh: held.speedKmh,
+        gradePct: held.gradePct,
+        stepIndex: held.stepIndex,
+        stepLabel: held.stepLabel,
+        filled: true,
+      });
+      emitted.push(filledSample);
+      held.elapsedSec = fillElapsed;
+      this.nextWallSampleMs += 1000;
+      filledCount += 1;
+    }
+
+    // Emit the fresh live sample for the current wall-clock instant
+    const freshDt =
+      filledCount > 0
+        ? Math.max(0.1, remainingDt || (nowMs - this.lastRecordedTimestampMs) / 1000)
+        : input.dtSec;
+
+    const freshSample = this.recordSample({
+      ...input,
+      dtSec: freshDt,
+      filled: false,
+    });
+    emitted.push(freshSample);
+    this.nextWallSampleMs = nowMs + 1000;
+    return emitted;
   }
 
   /**
@@ -324,7 +636,7 @@ export class RideRecorder {
       workoutName: this.workoutName,
       activityName: this.activityName || this.workoutName,
       sceneryName: this.sceneryName || undefined,
-      gpsRouteName: this.gpsRoute?.name ?? 'Ura-shima Loop',
+      gpsRouteName: this.gpsRoute?.name ?? this.gpsRouteNameFallback,
       ftp: this.ftp,
       startTimeMs: this.startTimeMs,
       endTimeMs: Math.max(this.startTimeMs, endTimeMs),
@@ -359,7 +671,7 @@ export class RideRecorder {
     stepIndex: number,
     stepLabel: string,
     startTimeMs: number
-  ): ActiveLapAccumulator {
+  ): ActiveLapSnapshot {
     return {
       lapIndex,
       stepIndex,
@@ -384,7 +696,7 @@ export class RideRecorder {
     };
   }
 
-  private closeLapAccumulator(lap: ActiveLapAccumulator, endTimeMs: number): RecordedLap {
+  private closeLapAccumulator(lap: ActiveLapSnapshot, endTimeMs: number): RecordedLap {
     const safeEnd = Math.max(lap.startTimeMs, endTimeMs);
     const totalElapsedSec = Math.max(
       Math.round(lap.timerSec),
@@ -416,6 +728,21 @@ export class RideRecorder {
       calories: calculateCaloriesFromKj(lap.workKj),
     };
   }
+}
+
+/**
+ * Pure helper to finalize an UnfinishedRideRecovery directly into an immutable SavedRide
+ * (ready for IndexedDB storage, summary modal, and binary .FIT export).
+ */
+export function finalizeRecoveryToSavedRide(recovery: UnfinishedRideRecovery): SavedRide {
+  const temp = new RideRecorder();
+  temp.restoreFromRecovery(recovery, null);
+  const lastSample = recovery.samples[recovery.samples.length - 1];
+  const endTimeMs = Math.max(
+    recovery.meta.lastUpdatedMs,
+    lastSample?.timestampMs ?? recovery.meta.startTimeMs
+  );
+  return temp.finalize(endTimeMs)!;
 }
 
 function computeNormalizedPower(powerSamples1Hz: number[]): number {

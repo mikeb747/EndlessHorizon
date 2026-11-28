@@ -9,6 +9,7 @@ import express from 'express';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { verifyStravaUploadAccess } from './src/server/uploadAuth';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -186,6 +187,7 @@ async function startServer() {
       canOAuth,
       hasRefreshToken: hasClientId && hasClientSecret && hasRefresh,
       athleteName: stravaTokens.athleteName || null,
+      requiresUploadSecret: Boolean((process.env.STRAVA_UPLOAD_SECRET || '').trim()),
     });
   });
 
@@ -288,7 +290,7 @@ async function startServer() {
     } catch {
       res.status(500).send(`<!doctype html><html><body style="font-family:sans-serif;background:#08061a;color:#fb7185;padding:24px;">
         <p>Could not complete Strava sign-in. Please verify your Client ID and Client Secret.</p>
-        <script>if(window.opener){window.opener.postMessage({type:'STRAVA_OAUTH_ERROR'},'*');}</script>
+        <script>if(window.opener){window.opener.postMessage({type:'STRAVA_OAUTH_ERROR'},window.location.origin);}</script>
       </body></html>`);
     }
   });
@@ -299,6 +301,22 @@ async function startServer() {
     const xrw = req.get('X-Requested-With');
     if (xrw !== 'EndlessHorizonCycling') {
       res.status(403).json({ error: 'Missing required request header.' });
+      return;
+    }
+
+    // Shared-secret / localhost-only guard so hosted instances cannot be abused as open Strava proxies
+    const uploadAuth = verifyStravaUploadAccess({
+      providedSecret: req.get('X-Upload-Secret'),
+      configuredSecret: process.env.STRAVA_UPLOAD_SECRET,
+      remoteAddress: req.socket.remoteAddress,
+      hostHeader: req.get('host'),
+      forwardedForHeader: req.get('x-forwarded-for'),
+    });
+    if (!uploadAuth.allowed) {
+      res.status(uploadAuth.statusCode).json({
+        error: uploadAuth.error || 'Unauthorized Strava upload request.',
+        requiresSecret: Boolean(uploadAuth.requiresSecret),
+      });
       return;
     }
 

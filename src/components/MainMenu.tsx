@@ -1,5 +1,5 @@
 import { useMemo } from 'react';
-import { Bluetooth, BookOpen, History, Mountain, Play, Route, Settings, SlidersHorizontal, Volume2, VolumeX, Zap } from 'lucide-react';
+import { Bluetooth, BookOpen, Download, History, Mountain, Play, RotateCcw, Route, Settings, SlidersHorizontal, Trash2, Volume2, VolumeX, Zap } from 'lucide-react';
 import { formatClock } from '../core/zones';
 import { SceneryTheme, useAppStore } from '../store/useAppStore';
 import { getBrowserCompatibility } from '../utils/browserCheck';
@@ -23,6 +23,7 @@ export function MainMenu() {
   const trainerStatus = useAppStore((s) => s.trainerStatus);
   const hrStatus = useAppStore((s) => s.hrStatus);
   const savedRidesCount = useAppStore((s) => s.savedRides.length);
+  const unfinishedRide = useAppStore((s) => s.unfinishedRide);
   const audioEnabled = useAppStore((s) => s.audioEnabled);
   const audioMuted = useAppStore((s) => s.audioMuted);
   const audioMasterVolume = useAppStore((s) => s.audioMasterVolume);
@@ -34,6 +35,9 @@ export function MainMenu() {
   const setSceneryTheme = useAppStore((s) => s.setSceneryTheme);
   const startFreeRide = useAppStore((s) => s.startFreeRide);
   const toggleAudioMute = useAppStore((s) => s.toggleAudioMute);
+  const resumeUnfinishedRide = useAppStore((s) => s.resumeUnfinishedRide);
+  const saveUnfinishedRide = useAppStore((s) => s.saveUnfinishedRide);
+  const discardUnfinishedRide = useAppStore((s) => s.discardUnfinishedRide);
 
   const isMenuAudioAudible =
     audioEnabled && !audioMuted && audioMasterVolume > 0 && audioMenuVolume > 0;
@@ -67,6 +71,55 @@ export function MainMenu() {
 
       {/* Main Content */}
       <main className="relative z-10 flex-1 min-h-0 overflow-y-auto synth-scroll flex flex-col justify-center px-5 sm:px-8 py-6">
+        {unfinishedRide && (
+          <div
+            className="w-full max-w-5xl mx-auto mb-5 rounded-xl border border-amber-400/70 bg-[#1a1026]/95 px-4 sm:px-5 py-3.5 shadow-[0_0_24px_rgba(251,191,36,0.18)] flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+            data-testid="unfinished-ride-banner"
+          >
+            <div className="min-w-0">
+              <div className="text-[11px] font-display font-bold uppercase tracking-[0.16em] text-amber-300">
+                Unfinished Ride Recovered
+              </div>
+              <div className="text-sm sm:text-base font-bold text-white truncate mt-0.5">
+                {unfinishedRide.meta.activityName || unfinishedRide.meta.workoutName}
+              </div>
+              <div className="text-xs text-slate-300 tabular-nums mt-0.5">
+                {formatClock(Math.round(unfinishedRide.meta.elapsedSec))} elapsed ·{' '}
+                {(unfinishedRide.meta.distanceM / 1000).toFixed(2)} km ·{' '}
+                {unfinishedRide.samples.length} samples saved
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={resumeUnfinishedRide}
+                className="min-h-[42px] px-4 rounded-lg bg-gradient-to-r from-amber-400 to-pink-500 text-slate-950 font-display text-xs font-extrabold uppercase tracking-wider flex items-center gap-1.5 hover:brightness-110 transition-all whitespace-nowrap"
+                data-testid="resume-unfinished-ride"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                Resume Ride
+              </button>
+              <button
+                type="button"
+                onClick={() => void saveUnfinishedRide()}
+                className="min-h-[42px] px-3.5 rounded-lg bg-cyan-500/20 border border-cyan-400/70 text-cyan-100 font-display text-xs font-bold uppercase tracking-wider flex items-center gap-1.5 hover:bg-cyan-500/30 transition-colors whitespace-nowrap"
+                data-testid="save-unfinished-ride"
+              >
+                <Download className="w-3.5 h-3.5" />
+                Save &amp; FIT
+              </button>
+              <button
+                type="button"
+                onClick={() => void discardUnfinishedRide()}
+                className="min-h-[42px] px-3 rounded-lg bg-[#0e0a22] border border-slate-600 text-slate-300 hover:text-rose-200 hover:border-rose-400/60 text-xs font-bold uppercase tracking-wider flex items-center gap-1 transition-colors whitespace-nowrap"
+                data-testid="discard-unfinished-ride"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                Discard
+              </button>
+            </div>
+          </div>
+        )}
         <div className="w-full max-w-5xl mx-auto grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch">
           {/* Left Hero Column */}
           <div className="lg:col-span-7 flex flex-col justify-center space-y-5">

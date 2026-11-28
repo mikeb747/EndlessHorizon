@@ -6,6 +6,7 @@ import {
   ExternalLink,
   Flag,
   FolderArchive,
+  KeyRound,
   Loader2,
   Mountain,
   Trash2,
@@ -60,6 +61,9 @@ export function SavedRidesModal() {
     Record<string, { ok: boolean; message: string; activityId?: number | null }>
   >({});
   const [bannerMessage, setBannerMessage] = useState<{ ok: boolean; text: string } | null>(null);
+  // Kept strictly in React memory (never persisted to localStorage or sessionStorage)
+  const [uploadSecret, setUploadSecret] = useState('');
+  const [secretPromptVisible, setSecretPromptVisible] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -112,7 +116,7 @@ export function SavedRidesModal() {
       return next;
     });
 
-    const result = await uploadRideToStrava(ride);
+    const result = await uploadRideToStrava(ride, uploadSecret);
     setUploadingId(null);
 
     if (result.ok) {
@@ -129,6 +133,14 @@ export function SavedRidesModal() {
           activityId: result.activityId ?? null,
         },
       }));
+    } else if (result.requiresSecret) {
+      setSecretPromptVisible(true);
+      setBannerMessage({
+        ok: false,
+        text:
+          result.error ||
+          'Enter the server upload passphrase (STRAVA_UPLOAD_SECRET) to upload rides.',
+      });
     } else if (result.needsSetup) {
       setBannerMessage({
         ok: false,
@@ -197,6 +209,31 @@ export function SavedRidesModal() {
             </button>
           </div>
         </div>
+
+        {(stravaStatus?.requiresUploadSecret || secretPromptVisible) && (
+          <div
+            data-testid="strava-upload-secret-bar"
+            className="mx-6 mt-4 rounded-lg px-4 py-2.5 border border-cyan-500/35 bg-[#0a0820] flex flex-wrap items-center gap-3"
+          >
+            <label
+              htmlFor="strava-upload-secret-input"
+              className="text-xs font-display font-bold uppercase tracking-wider text-cyan-200 flex items-center gap-1.5 shrink-0"
+            >
+              <KeyRound className="w-3.5 h-3.5 text-cyan-300" />
+              Upload Passphrase
+            </label>
+            <input
+              id="strava-upload-secret-input"
+              type="password"
+              autoComplete="off"
+              value={uploadSecret}
+              onChange={(e) => setUploadSecret(e.target.value)}
+              placeholder="Enter STRAVA_UPLOAD_SECRET (session memory only)"
+              data-testid="strava-upload-secret-input"
+              className="flex-1 min-w-[200px] min-h-[36px] rounded-md bg-[#060414] border border-cyan-500/40 px-3 text-xs text-white placeholder:text-slate-500 focus:outline-none focus:border-cyan-300"
+            />
+          </div>
+        )}
 
         {bannerMessage && (
           <div

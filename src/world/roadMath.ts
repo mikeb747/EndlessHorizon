@@ -539,6 +539,17 @@ export interface WorldRuntimeState {
   cameraZ: number;
   drawnInstances: number;
   culledInstances: number;
+  // Live telemetry populated from LiveTelemetryBuffer inside SceneDriver (zero React re-renders)
+  livePower: number;
+  livePower3s: number;
+  liveCadence: number;
+  liveSpeedKmh: number;
+  liveFtpPct: number;
+  liveTargetWatts: number;
+  liveTss: number;
+  liveZoneHex: string;
+  // Adaptive graphics governor scenery instance multiplier (1.0 normal, 0.5 degraded)
+  sceneryScale: number;
 }
 
 export function createWorldRuntime(): WorldRuntimeState {
@@ -576,5 +587,14 @@ export function createWorldRuntime(): WorldRuntimeState {
     cameraZ: 4.7,
     drawnInstances: 0,
     culledInstances: 0,
+    livePower: 0,
+    livePower3s: 0,
+    liveCadence: 0,
+    liveSpeedKmh: 0,
+    liveFtpPct: 0,
+    liveTargetWatts: 170,
+    liveTss: 0,
+    liveZoneHex: '#00f0ff',
+    sceneryScale: 1.0,
   };
 }

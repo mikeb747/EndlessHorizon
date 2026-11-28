@@ -4,6 +4,7 @@
  * communication for stable timing and ERG keep-alive heartbeats.
  */
 
+import { WorkoutWallClock } from '../core/workoutClock';
 import { ActiveStepSnapshot, evaluateWorkoutAtTime } from '../core/workoutEngine';
 import { getEffectiveFtp, getTargetWatts } from '../core/zones';
 import { FlattenedStep, ParsedWorkout, WorkoutTreeNode } from '../core/zwoParser';
@@ -40,6 +41,7 @@ export interface WorkoutTickEvent {
   snapshot: ActiveStepSnapshot | null;
   stepChanged: boolean;
   shouldSendErg: boolean;
+  resumeGapSec?: number;
   nowMs: number;
 }
 
@@ -98,6 +100,7 @@ export class WorkoutEngine {
   private readonly workerFactory?: () => WorkerLike;
 
   // Fallback main-thread timers when Web Workers are unavailable
+  private readonly fallbackClock = new WorkoutWallClock();
   private fallbackTickTimer: ReturnType<typeof setInterval> | null = null;
   private fallbackKeepAliveTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -136,6 +139,7 @@ export class WorkoutEngine {
     }
     this.elapsedSec = 0;
     this.runState = 'idle';
+    this.fallbackClock.load(workout.totalDuration, 0);
     this.snapshot = this.evaluateAt(0);
     this.syncWorkoutToWorker();
     return this.snapshot;
@@ -298,6 +302,7 @@ export class WorkoutEngine {
   public pause(): void {
     if (this.runState !== 'running') return;
     this.runState = 'paused';
+    this.fallbackClock.pause(Date.now());
     this.postToWorker({ type: 'PAUSE' });
     this.stopFallbackTimers();
   }
@@ -327,6 +332,7 @@ export class WorkoutEngine {
   public seek(elapsedSec: number): ActiveStepSnapshot | null {
     const clamped = Math.max(0, Math.min(this.workout.totalDuration, elapsedSec));
     this.elapsedSec = clamped;
+    this.fallbackClock.seek(clamped, Date.now());
     this.snapshot = this.evaluateAt(clamped);
     this.postToWorker({ type: 'SEEK', elapsedSec: clamped });
 
@@ -408,6 +414,7 @@ export class WorkoutEngine {
       snapshot: snap,
       stepChanged,
       shouldSendErg,
+      resumeGapSec: dtSec > 1.5 ? dtSec : 0,
       nowMs,
     };
 
@@ -503,6 +510,7 @@ export class WorkoutEngine {
           snapshot: msg.snapshot,
           stepChanged: msg.stepChanged,
           shouldSendErg: msg.shouldSendErg,
+          resumeGapSec: msg.resumeGapSec,
           nowMs: msg.nowMs,
         });
         break;
@@ -549,8 +557,13 @@ export class WorkoutEngine {
 
   private startFallbackTimers(): void {
     this.stopFallbackTimers();
+    this.fallbackClock.load(this.workout.totalDuration, this.elapsedSec);
+    this.fallbackClock.start(Date.now(), this.elapsedSec);
     this.fallbackTickTimer = setInterval(() => {
-      this.tick(1);
+      const poll = this.fallbackClock.poll(Date.now());
+      if (poll.dtSec > 0) {
+        this.tick(poll.dtSec);
+      }
     }, 1000);
     this.fallbackKeepAliveTimer = setInterval(() => {
       if (this.runState !== 'running' || !this.snapshot) return;

@@ -31,6 +31,8 @@ export interface RecordedSample {
   lonDeg: number;
   /** Active workout timeline step index */
   stepIndex: number;
+  /** True when this 1 Hz sample was forward-filled after a main-thread stall */
+  filled?: boolean;
 }
 
 export interface RecordedLap {
@@ -136,5 +138,72 @@ export interface SavedRide {
   uploadedAtMs?: number;
   stravaActivityId?: number | null;
   records: RecordedSample[];
+  laps: RecordedLap[];
+}
+
+export interface ActiveLapSnapshot {
+  lapIndex: number;
+  stepIndex: number;
+  stepLabel: string;
+  startTimeMs: number;
+  startDistanceM: number;
+  timerSec: number;
+  ascentM: number;
+  descentM: number;
+  workKj: number;
+  sampleCount: number;
+  powerSum: number;
+  maxPower: number;
+  hrSum: number;
+  hrCount: number;
+  maxHr: number;
+  cadenceSum: number;
+  cadenceCount: number;
+  maxCadence: number;
+  speedSum: number;
+  maxSpeed: number;
+}
+
+export interface ActiveRideMeta {
+  sessionId: string;
+  rideMode: 'workout' | 'freeride';
+  workoutId: string;
+  workoutName: string;
+  activityName: string;
+  sceneryName: string;
+  sceneryTheme: SceneryDisplayId;
+  visitedSceneries: SceneryDisplayId[];
+  gpsRouteName: string;
+  ftp: number;
+  startTimeMs: number;
+  lastUpdatedMs: number;
+  elapsedSec: number;
+  totalTimerSec: number;
+  distanceM: number;
+  altitudeM: number;
+  totalAscentM: number;
+  totalDescentM: number;
+  totalWorkKj: number;
+  freeRideZone: number;
+  freeRideOffsetWatts: number;
+  activeLap: ActiveLapSnapshot | null;
+  nextChunkSeq: number;
+  sampleCount: number;
+  closedLapCount: number;
+}
+
+export interface ActiveRideChunk {
+  id: string;
+  sessionId: string;
+  seq: number;
+  createdAtMs: number;
+  samples: RecordedSample[];
+  closedLaps: RecordedLap[];
+}
+
+export interface UnfinishedRideRecovery {
+  meta: ActiveRideMeta;
+  chunks: ActiveRideChunk[];
+  samples: RecordedSample[];
   laps: RecordedLap[];
 }

@@ -28,9 +28,9 @@ import {
   ROAD_Z_SPAN,
   RoadSample,
   sampleRoadAtZ,
-  SKY_DOME_RADIUS,
   WorldRuntimeState,
 } from './roadMath';
+import { getUnifiedSkyThemeParams } from './roadShaderHelpers';
 
 interface SceneryThemesProps {
   runtimeRef: React.MutableRefObject<WorldRuntimeState>;
@@ -38,9 +38,25 @@ interface SceneryThemesProps {
   quality: QualityLevel;
 }
 
+// Module-level scratch objects (zero per-frame allocations in all useFrame callbacks)
 const _dummy = new THREE.Object3D();
 const _sample: RoadSample = { x: 0, y: 0, slopeX: 0, slopeY: 0 };
 const _color = new THREE.Color();
+const _camRight = new THREE.Vector3();
+const _camUp = new THREE.Vector3();
+const _camForward = new THREE.Vector3();
+
+// Preallocated palette Color constants (avoids per-instance hex string parsing inside useFrame)
+const _colCyanTrash = new THREE.Color('#00e8ff');
+const _colPinkTrash = new THREE.Color('#ff3ca8');
+const _colMagentaBike = new THREE.Color('#ff2a9d');
+const _colCyanBike = new THREE.Color('#00f0ff');
+const _colCyanPalm = new THREE.Color('#00d8e8');
+const _colPinkPalm = new THREE.Color('#e63a9c');
+const _colCyanRain = new THREE.Color('#5cf0ff');
+const _colPinkRain = new THREE.Color('#e68aff');
+const _colCyanBollard = new THREE.Color('#3cf0ff');
+const _colAmberBollard = new THREE.Color('#ff9852');
 
 // Shared precomputed non-linear LOD Z coordinates and linear UV-t values (allocated once)
 const STRIP_SEGMENTS = ROAD_SEGMENTS;
@@ -52,16 +68,9 @@ for (let i = 0; i <= STRIP_SEGMENTS; i++) {
   STRIP_LINEAR_T[i] = computeLinearRoadT(z, ROAD_Z_NEAR, ROAD_Z_FAR);
 }
 
-// Reusable per-frame centerline buffers for Neon City sidewalks
+// Reusable per-frame centerline buffers for Neon City sidewalks & Causeway embankments
 const _cityCenterX = new Float32Array(STRIP_SEGMENTS + 1);
 const _cityCenterY = new Float32Array(STRIP_SEGMENTS + 1);
-
-function themeToShaderIndex(theme: SceneryTheme): number {
-  if (theme === 'causeway-embankment') return 3;
-  if (theme === 'cloud-horizon') return 2;
-  if (theme === 'palm-grove') return 1;
-  return 0;
-}
 
 /**
  * Shared terrain-conforming wide ground/water ribbon matching NeonRoad's non-linear
@@ -144,311 +153,248 @@ function updateLevelRibbonFromRoad(
 }
 
 /**
- * Full 360° procedural Synthwave Sky Dome centered on the camera every frame.
- * Guarantees seamless sky coverage across ultrawide monitors (21:9 / 32:9) AND steep
- * uphill climbs (+20% grade) so the edge or end of the sky can never appear.
+ * Unified single-draw-call full-screen shader rendering Sky Gradient + Twinkling Stars +
+ * Synthwave Horizon Sun + Soft Outer Halo across all 4 scenery themes.
+ * Reconstructs exact camera view rays per pixel (zero geometry tessellation, zero overdraw,
+ * zero per-frame allocations) and smoothly tracks camera FOV, aspect ratio, and climb pitch.
  */
-function SynthwaveSkyDome({
+function UnifiedSynthwaveSky({
   theme,
   runtimeRef,
 }: {
   theme: SceneryTheme;
   runtimeRef: React.MutableRefObject<WorldRuntimeState>;
 }) {
-  const domeRef = useRef<THREE.Mesh>(null);
-
   const material = useMemo(() => {
+    const initial = getUnifiedSkyThemeParams(theme);
     return new THREE.ShaderMaterial({
-      side: THREE.BackSide,
+      depthTest: false,
       depthWrite: false,
       fog: false,
       uniforms: {
-        uTheme: { value: themeToShaderIndex(theme) },
+        uTheme: { value: initial.shaderIndex },
+        uTime: { value: 0 },
         uPitchOffset: { value: 0 },
+        uSunElev: { value: initial.sunBaseElev },
+        uSunRadius: { value: initial.sunAngularRadius },
+        uHaloColor: { value: new THREE.Color(initial.haloColorHex) },
+        uCamRight: { value: new THREE.Vector3(1, 0, 0) },
+        uCamUp: { value: new THREE.Vector3(0, 1, 0) },
+        uCamForward: { value: new THREE.Vector3(0, 0, -1) },
+        uAspect: { value: 1.77 },
+        uTanHalfFov: { value: Math.tan(THREE.MathUtils.degToRad(30)) },
       },
       vertexShader: `
-        varying vec3 vDir;
+        varying vec2 vNdc;
         void main() {
-          vDir = normalize(position);
-          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+          vNdc = position.xy;
+          gl_Position = vec4(position.xy, 0.9999, 1.0);
         }
       `,
       fragmentShader: `
-        varying vec3 vDir;
+        varying vec2 vNdc;
+
         uniform float uTheme;
+        uniform float uTime;
         uniform float uPitchOffset;
+        uniform float uSunElev;
+        uniform float uSunRadius;
+        uniform vec3 uHaloColor;
+        uniform vec3 uCamRight;
+        uniform vec3 uCamUp;
+        uniform vec3 uCamForward;
+        uniform float uAspect;
+        uniform float uTanHalfFov;
+
+        float hash21(vec2 p) {
+          p = fract(p * vec2(123.34, 456.21));
+          p += dot(p, p + 45.32);
+          return fract(p.x * p.y);
+        }
 
         void main() {
-          // Elevation angle relative to pitch-tracked horizon (-1 nadir .. 0 horizon .. +1 zenith)
-          float elev = vDir.y - uPitchOffset;
-          vec3 col;
+          vec3 rayDir = normalize(
+            uCamForward
+            + uCamRight * (vNdc.x * uAspect * uTanHalfFov)
+            + uCamUp * (vNdc.y * uTanHalfFov)
+          );
+
+          // 1) Theme-specific 360-degree synthwave sky gradient
+          float elev = rayDir.y - uPitchOffset;
+          vec3 skyCol;
 
           if (uTheme > 2.5) {
-            // Island Causeway (North Frisian Wadden Sea coastal synthwave twilight)
+            // Island Causeway
             vec3 nadirCol = vec3(0.03, 0.08, 0.16);
             vec3 horCol   = vec3(0.76, 0.36, 0.48);
             vec3 midCol   = vec3(0.11, 0.24, 0.42);
             vec3 topCol   = vec3(0.03, 0.06, 0.16);
-
             vec3 upper = mix(horCol, midCol, smoothstep(0.0, 0.26, max(0.0, elev)));
             upper = mix(upper, topCol, smoothstep(0.22, 0.74, max(0.0, elev)));
-            col = mix(nadirCol, upper, smoothstep(-0.12, 0.04, elev));
+            skyCol = mix(nadirCol, upper, smoothstep(-0.12, 0.04, elev));
           } else if (uTheme > 1.5) {
-            // Cloud Horizon: luminous pink-magenta horizon -> violet mid-sky -> deep cosmic indigo zenith
+            // Cloud Horizon
             vec3 nadirCol = vec3(0.08, 0.04, 0.22);
             vec3 horCol   = vec3(0.86, 0.34, 0.62);
             vec3 midCol   = vec3(0.38, 0.11, 0.56);
             vec3 topCol   = vec3(0.07, 0.035, 0.22);
-
             vec3 upper = mix(horCol, midCol, smoothstep(0.0, 0.28, max(0.0, elev)));
             upper = mix(upper, topCol, smoothstep(0.24, 0.78, max(0.0, elev)));
-            col = mix(nadirCol, upper, smoothstep(-0.14, 0.04, elev));
+            skyCol = mix(nadirCol, upper, smoothstep(-0.14, 0.04, elev));
           } else if (uTheme > 0.5) {
-            // Palm Grove: warm dusk magenta-violet horizon -> twilight purple -> starlit midnight zenith
+            // Palm Grove
             vec3 nadirCol = vec3(0.06, 0.025, 0.16);
             vec3 horCol   = vec3(0.36, 0.10, 0.44);
             vec3 midCol   = vec3(0.15, 0.05, 0.30);
             vec3 topCol   = vec3(0.045, 0.02, 0.13);
-
             vec3 upper = mix(horCol, midCol, smoothstep(0.0, 0.24, max(0.0, elev)));
             upper = mix(upper, topCol, smoothstep(0.20, 0.72, max(0.0, elev)));
-            col = mix(nadirCol, upper, smoothstep(-0.12, 0.04, elev));
+            skyCol = mix(nadirCol, upper, smoothstep(-0.12, 0.04, elev));
           } else {
-            // Neon City: midnight purple city horizon glow -> deep synthwave indigo -> obsidian zenith
+            // Neon City
             vec3 nadirCol = vec3(0.04, 0.02, 0.11);
             vec3 horCol   = vec3(0.24, 0.08, 0.42);
             vec3 midCol   = vec3(0.09, 0.035, 0.23);
             vec3 topCol   = vec3(0.028, 0.012, 0.09);
-
             vec3 upper = mix(horCol, midCol, smoothstep(0.0, 0.22, max(0.0, elev)));
             upper = mix(upper, topCol, smoothstep(0.18, 0.68, max(0.0, elev)));
-            col = mix(nadirCol, upper, smoothstep(-0.10, 0.04, elev));
+            skyCol = mix(nadirCol, upper, smoothstep(-0.10, 0.04, elev));
           }
 
-          gl_FragColor = vec4(col, 1.0);
+          // 2) Procedural twinkling stars across upper sky (zero extra geometry or draw calls)
+          if (elev > 0.05) {
+            float az = atan(rayDir.x, -rayDir.z);
+            float el = asin(clamp(rayDir.y, -1.0, 1.0));
+            vec2 starGrid = vec2(az * 34.0, el * 34.0);
+            vec2 cell = floor(starGrid);
+            vec2 f = fract(starGrid) - 0.5;
+            float rnd = hash21(cell);
+            if (rnd > 0.90) {
+              vec2 starOff = vec2(hash21(cell + 17.3) - 0.5, hash21(cell + 41.9) - 0.5) * 0.62;
+              float distToStar = length(f - starOff);
+              float starRadius = mix(0.045, 0.09, fract(rnd * 27.1));
+              float starCore = 1.0 - smoothstep(0.0, starRadius, distToStar);
+              float twinkle = 0.68 + 0.32 * sin(uTime * (1.8 + fract(rnd * 13.7) * 2.4) + rnd * 62.8);
+              float horizonFade = smoothstep(0.06, 0.24, elev);
+              skyCol += vec3(0.84, 0.91, 1.0) * starCore * twinkle * horizonFade * 0.92;
+            }
+          }
+
+          // 3) Synthwave Horizon Sun + soft outer halo projected onto the forward sky hemisphere
+          if (rayDir.z < -0.15) {
+            float invZ = 1.0 / max(0.15, -rayDir.z);
+            vec2 sunProj = vec2(rayDir.x * invZ, rayDir.y * invZ - uSunElev);
+            vec2 sunP = sunProj / max(0.05, uSunRadius);
+            float sunD = length(sunP);
+
+            // Soft outer halo glow around the horizon sun
+            float halo = exp(-sunD * sunD * 1.45) * 0.24;
+            skyCol += uHaloColor * halo;
+
+            if (sunD < 1.02) {
+              float y = clamp(sunP.y * 0.5 + 0.5, 0.0, 1.0);
+              vec3 sunCol;
+              float alpha = 1.0 - smoothstep(0.955, 1.0, sunD);
+
+              if (uTheme > 2.5) {
+                // Island Causeway coastal sunset orb
+                vec3 topCol = vec3(1.0, 0.78, 0.44);
+                vec3 midCol = vec3(0.98, 0.46, 0.44);
+                vec3 botCol = vec3(0.86, 0.28, 0.56);
+                sunCol = mix(botCol, midCol, smoothstep(0.0, 0.48, y));
+                sunCol = mix(sunCol, topCol, smoothstep(0.45, 1.0, y));
+                float stripeAlpha = 1.0;
+                if (y < 0.46) {
+                  float stripeWave = fract(y * 16.0 - uTime * 0.04);
+                  float gapThickness = mix(0.38, 0.08, y / 0.46);
+                  stripeAlpha = step(gapThickness, stripeWave);
+                }
+                alpha *= stripeAlpha;
+                sunCol *= 1.12;
+              } else if (uTheme > 1.5) {
+                // Cloud Horizon radiant white-cyan glowing orb
+                vec3 core = vec3(0.95, 0.99, 1.0);
+                vec3 mid = vec3(0.45, 0.92, 1.0);
+                vec3 rim = vec3(0.92, 0.45, 0.98);
+                sunCol = mix(core, mid, smoothstep(0.18, 0.86, sunD));
+                sunCol = mix(sunCol, rim, smoothstep(0.84, 1.0, sunD));
+                sunCol *= 1.15;
+              } else {
+                if (uTheme > 0.5) {
+                  // Palm Grove warm coral-magenta to golden sunset
+                  vec3 topCol = vec3(0.92, 0.30, 0.62);
+                  vec3 midCol = vec3(0.96, 0.48, 0.42);
+                  vec3 botCol = vec3(0.98, 0.72, 0.36);
+                  sunCol = mix(botCol, midCol, smoothstep(0.0, 0.52, y));
+                  sunCol = mix(sunCol, topCol, smoothstep(0.48, 1.0, y));
+                } else {
+                  // Neon City electric magenta to hot orange
+                  vec3 topCol = vec3(0.98, 0.14, 0.74);
+                  vec3 midCol = vec3(0.98, 0.32, 0.56);
+                  vec3 botCol = vec3(1.0, 0.68, 0.22);
+                  sunCol = mix(botCol, midCol, smoothstep(0.0, 0.55, y));
+                  sunCol = mix(sunCol, topCol, smoothstep(0.50, 1.0, y));
+                }
+                float stripeAlpha = 1.0;
+                if (y < 0.62) {
+                  float stripeWave = fract(y * 18.0 - uTime * 0.06);
+                  float gapThickness = mix(0.46, 0.10, y / 0.62);
+                  stripeAlpha = step(gapThickness, stripeWave);
+                }
+                alpha *= stripeAlpha;
+                sunCol *= 1.1;
+              }
+
+              skyCol = mix(skyCol, sunCol, clamp(alpha, 0.0, 1.0));
+            }
+          }
+
+          gl_FragColor = vec4(skyCol, 1.0);
         }
       `,
     });
   }, []);
 
   useEffect(() => {
-    material.uniforms.uTheme.value = themeToShaderIndex(theme);
+    const params = getUnifiedSkyThemeParams(theme);
+    material.uniforms.uTheme.value = params.shaderIndex;
+    material.uniforms.uSunRadius.value = params.sunAngularRadius;
+    (material.uniforms.uHaloColor.value as THREE.Color).set(params.haloColorHex);
   }, [theme, material]);
 
   useEffect(() => () => material.dispose(), [material]);
 
   useFrame((state, delta) => {
-    if (domeRef.current) {
-      domeRef.current.position.copy(state.camera.position);
-    }
-    // Gently track uphill gradient so the glowing horizon band rises smoothly on steep climbs
-    const targetPitch = runtimeRef.current.currentGrade * 0.26;
+    const dt = Math.min(0.1, delta);
+    const cam = state.camera as THREE.PerspectiveCamera;
+    const params = getUnifiedSkyThemeParams(theme);
+
+    // Extract camera basis into module-level scratch vectors (ZERO allocations)
+    cam.matrixWorld.extractBasis(_camRight, _camUp, _camForward);
+    _camForward.negate();
+
+    (material.uniforms.uCamRight.value as THREE.Vector3).copy(_camRight);
+    (material.uniforms.uCamUp.value as THREE.Vector3).copy(_camUp);
+    (material.uniforms.uCamForward.value as THREE.Vector3).copy(_camForward);
+    material.uniforms.uAspect.value = cam.aspect;
+    material.uniforms.uTanHalfFov.value = Math.tan(THREE.MathUtils.degToRad(cam.fov * 0.5));
+    material.uniforms.uTime.value += dt;
+
+    const grade = runtimeRef.current.currentGrade;
+    const targetPitch = grade * 0.26;
+    const damp = Math.min(1, dt * 4);
     material.uniforms.uPitchOffset.value +=
-      (targetPitch - material.uniforms.uPitchOffset.value) * Math.min(1, delta * 4);
+      (targetPitch - material.uniforms.uPitchOffset.value) * damp;
+
+    const targetSunElev = params.sunBaseElev + grade * 0.72;
+    material.uniforms.uSunElev.value +=
+      (targetSunElev - material.uniforms.uSunElev.value) * damp;
   });
 
   return (
-    <mesh ref={domeRef} material={material} frustumCulled={false} renderOrder={-10}>
-      <sphereGeometry args={[SKY_DOME_RADIUS, 24, 16]} />
+    <mesh material={material} frustumCulled={false} renderOrder={-100}>
+      <planeGeometry args={[2, 2]} />
     </mesh>
-  );
-}
-
-/**
- * Procedural Synthwave Horizon Sun shader supporting all four themes:
- * - neon-city: striped vibrant pink-magenta to orange sun
- * - palm-grove: warm coral-pink to amber striped sunset sun
- * - cloud-horizon: huge glowing radiant white-cyan orb
- * - causeway-embankment: warm North Sea golden-amber to coral coastal sunset orb
- */
-function SynthwaveSun({
-  theme,
-  runtimeRef,
-}: {
-  theme: SceneryTheme;
-  runtimeRef: React.MutableRefObject<WorldRuntimeState>;
-}) {
-  const groupRef = useRef<THREE.Group>(null);
-  const material = useMemo(() => {
-    return new THREE.ShaderMaterial({
-      transparent: true,
-      depthWrite: false,
-      fog: false,
-      uniforms: {
-        uMode: { value: themeToShaderIndex(theme) },
-        uTime: { value: 0 },
-      },
-      vertexShader: `
-        varying vec2 vUv;
-        void main() {
-          vUv = uv;
-          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-        }
-      `,
-      fragmentShader: `
-        varying vec2 vUv;
-        uniform float uMode;
-        uniform float uTime;
-
-        void main() {
-          vec2 p = vUv * 2.0 - 1.0;
-          float d = length(p);
-          if (d > 1.0) discard;
-
-          float y = vUv.y;
-          vec3 col;
-
-          if (uMode > 2.5) {
-            // Island Causeway: warm golden-amber to coral North Sea coastal sunset
-            vec3 topCol = vec3(1.0, 0.78, 0.44);
-            vec3 midCol = vec3(0.98, 0.46, 0.44);
-            vec3 botCol = vec3(0.86, 0.28, 0.56);
-            col = mix(botCol, midCol, smoothstep(0.0, 0.48, y));
-            col = mix(col, topCol, smoothstep(0.45, 1.0, y));
-
-            float stripeAlpha = 1.0;
-            if (y < 0.46) {
-              float stripeWave = fract(y * 16.0 - uTime * 0.04);
-              float gapThickness = mix(0.38, 0.08, y / 0.46);
-              stripeAlpha = step(gapThickness, stripeWave);
-            }
-            float edge = 1.0 - smoothstep(0.95, 1.0, d);
-            gl_FragColor = vec4(col * 1.12, edge * stripeAlpha);
-            return;
-          }
-
-          if (uMode > 1.5) {
-            // Cloud Horizon: radiant white-cyan glowing orb
-            vec3 core = vec3(0.95, 0.99, 1.0);
-            vec3 mid = vec3(0.45, 0.92, 1.0);
-            vec3 rim = vec3(0.92, 0.45, 0.98);
-            col = mix(core, mid, smoothstep(0.18, 0.86, d));
-            col = mix(col, rim, smoothstep(0.84, 1.0, d));
-            float alpha = 1.0 - smoothstep(0.95, 1.0, d);
-            gl_FragColor = vec4(col * 1.15, alpha);
-            return;
-          }
-
-          if (uMode > 0.5) {
-            // Palm Grove: warm coral-magenta to golden orange
-            vec3 topCol = vec3(0.92, 0.30, 0.62);
-            vec3 midCol = vec3(0.96, 0.48, 0.42);
-            vec3 botCol = vec3(0.98, 0.72, 0.36);
-            col = mix(botCol, midCol, smoothstep(0.0, 0.52, y));
-            col = mix(col, topCol, smoothstep(0.48, 1.0, y));
-          } else {
-            // Neon City: electric magenta top to hot orange bottom
-            vec3 topCol = vec3(0.98, 0.14, 0.74);
-            vec3 midCol = vec3(0.98, 0.32, 0.56);
-            vec3 botCol = vec3(1.0, 0.68, 0.22);
-            col = mix(botCol, midCol, smoothstep(0.0, 0.55, y));
-            col = mix(col, topCol, smoothstep(0.50, 1.0, y));
-          }
-
-          // Iconic horizontal synthwave horizon stripes on lower 62% of sun
-          float stripeAlpha = 1.0;
-          if (y < 0.62) {
-            float freq = 18.0;
-            float stripeWave = fract(y * freq - uTime * 0.06);
-            float gapThickness = mix(0.46, 0.10, y / 0.62);
-            stripeAlpha = step(gapThickness, stripeWave);
-          }
-
-          float edge = 1.0 - smoothstep(0.96, 1.0, d);
-          gl_FragColor = vec4(col * 1.1, edge * stripeAlpha);
-        }
-      `,
-    });
-  }, []);
-
-  useEffect(() => {
-    material.uniforms.uMode.value = themeToShaderIndex(theme);
-  }, [theme, material]);
-
-  useEffect(() => () => material.dispose(), [material]);
-
-  // Positioned behind the extended -265m road & -310m distant skyline, scaled proportionally
-  const radius = theme === 'cloud-horizon' ? 78 : theme === 'causeway-embankment' ? 66 : 70;
-  const baseY = theme === 'cloud-horizon' ? 38 : theme === 'causeway-embankment' ? 36 : 42;
-  const haloColor =
-    theme === 'cloud-horizon'
-      ? '#66e8ff'
-      : theme === 'causeway-embankment'
-        ? '#ff925c'
-        : '#ff2a9d';
-
-  useFrame((_, delta) => {
-    material.uniforms.uTime.value += Math.min(0.1, delta);
-    if (groupRef.current) {
-      // Lift horizon sun smoothly with climbing gradient so it crowns steep 20% ascents
-      const targetY = baseY + runtimeRef.current.currentGrade * 240;
-      groupRef.current.position.y +=
-        (targetY - groupRef.current.position.y) * Math.min(1, delta * 4);
-    }
-  });
-
-  return (
-    <group ref={groupRef} position={[0, baseY, -335]}>
-      <mesh material={material}>
-        <planeGeometry args={[radius * 2, radius * 2]} />
-      </mesh>
-      {/* Subtle outer sun halo */}
-      <mesh position={[0, 0, -2]}>
-        <circleGeometry args={[radius * 1.28, 36]} />
-        <meshBasicMaterial
-          color={haloColor}
-          transparent
-          opacity={0.14}
-          depthWrite={false}
-          fog={false}
-          blending={THREE.AdditiveBlending}
-        />
-      </mesh>
-    </group>
-  );
-}
-
-/**
- * Forward-hemisphere dome Starfield concentrated inside the forward viewing cone
- * (-78°..+78° azimuth) so zero GPU vertices are wasted behind the camera.
- */
-function Starfield() {
-  const pointsGeo = useMemo(() => {
-    const count = 320;
-    const positions = new Float32Array(count * 3);
-    for (let i = 0; i < count; i++) {
-      const seed = (i + 1) * 12.9898;
-      // Forward viewing cone azimuth (-78° .. +78° around -Z) + upper sky elevation (4° .. 76°)
-      const u1 = Math.sin(seed * 1.37) * 0.5 + 0.5;
-      const u2 = Math.sin(seed * 2.91) * 0.5 + 0.5;
-      const u3 = Math.sin(seed * 4.73) * 0.5 + 0.5;
-      const azimuth = (u1 * 2 - 1) * Math.PI * 0.44;
-      const elevation = 0.07 + Math.pow(u2, 0.85) * 1.25;
-      const radius = 365 + u3 * 28;
-      const cosElev = Math.cos(elevation);
-      positions[i * 3 + 0] = Math.sin(azimuth) * cosElev * radius;
-      positions[i * 3 + 1] = Math.sin(elevation) * radius;
-      positions[i * 3 + 2] = -Math.cos(azimuth) * cosElev * radius;
-    }
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    return geo;
-  }, []);
-
-  useEffect(() => () => pointsGeo.dispose(), [pointsGeo]);
-
-  return (
-    <points geometry={pointsGeo} frustumCulled={false}>
-      <pointsMaterial
-        color="#d8e8ff"
-        size={1.45}
-        sizeAttenuation
-        transparent
-        opacity={0.82}
-        depthWrite={false}
-        fog={false}
-      />
-    </points>
   );
 }
 
@@ -1134,12 +1080,13 @@ function NeonCityScenery({ runtimeRef }: { runtimeRef: React.MutableRefObject<Wo
     const planes = rt.frustumPlanes;
     const useFrustum = rt.frustumReady;
     const nearWrapZ = 9;
+    const sceneryStride = rt.sceneryScale < 0.75 ? 2 : 1;
 
     // Frustum-cull & compact distant horizon skyline so narrow/standard windows skip off-axis towers
     if (farSkylineRef.current) {
       const skylineLiftY = rt.currentGrade * 145;
       let visFar = 0;
-      for (let i = 0; i < farSkylineCount; i++) {
+      for (let i = 0; i < farSkylineCount; i += sceneryStride) {
         const f = farSkylineSeeds[i];
         const cy = f.h * 0.5 - 6 + skylineLiftY;
         if (
@@ -1164,7 +1111,7 @@ function NeonCityScenery({ runtimeRef }: { runtimeRef: React.MutableRefObject<Wo
     // Frustum-cull & compact boulevard skyscrapers (skips behind-camera & off-screen towers)
     if (bldgMeshRef.current) {
       let visBldg = 0;
-      for (let i = 0; i < bldgCount; i++) {
+      for (let i = 0; i < bldgCount; i += sceneryStride) {
         const s = bldgSeeds[i];
         const raw = (s.slotZ - dist) % bldgSpan;
         const wrapped = raw < 0 ? raw + bldgSpan : raw;
@@ -1206,7 +1153,7 @@ function NeonCityScenery({ runtimeRef }: { runtimeRef: React.MutableRefObject<Wo
 
     if (trashBodyRef.current && trashAccentRef.current) {
       let visTrash = 0;
-      for (let i = 0; i < trashCount; i++) {
+      for (let i = 0; i < trashCount; i += sceneryStride) {
         const t = trashSeeds[i];
         const raw = (t.slotZ - dist) % propSpan;
         const wrapped = raw < 0 ? raw + propSpan : raw;
@@ -1237,8 +1184,7 @@ function NeonCityScenery({ runtimeRef }: { runtimeRef: React.MutableRefObject<Wo
         _dummy.updateMatrix();
         trashBodyRef.current.setMatrixAt(visTrash, _dummy.matrix);
         trashAccentRef.current.setMatrixAt(visTrash, _dummy.matrix);
-        _color.set(t.isCyan ? '#00e8ff' : '#ff3ca8');
-        trashAccentRef.current.setColorAt(visTrash, _color);
+        trashAccentRef.current.setColorAt(visTrash, t.isCyan ? _colCyanTrash : _colPinkTrash);
         visTrash += 1;
       }
       rt.drawnInstances += visTrash;
@@ -1253,7 +1199,7 @@ function NeonCityScenery({ runtimeRef }: { runtimeRef: React.MutableRefObject<Wo
 
     if (bikeFrameRef.current && bikeAccentRef.current) {
       let visBike = 0;
-      for (let i = 0; i < bikeCount; i++) {
+      for (let i = 0; i < bikeCount; i += sceneryStride) {
         const b = bikeSeeds[i];
         const raw = (b.slotZ - dist) % propSpan;
         const wrapped = raw < 0 ? raw + propSpan : raw;
@@ -1284,8 +1230,7 @@ function NeonCityScenery({ runtimeRef }: { runtimeRef: React.MutableRefObject<Wo
         _dummy.updateMatrix();
         bikeFrameRef.current.setMatrixAt(visBike, _dummy.matrix);
         bikeAccentRef.current.setMatrixAt(visBike, _dummy.matrix);
-        _color.set(b.isMagenta ? '#ff2a9d' : '#00f0ff');
-        bikeAccentRef.current.setColorAt(visBike, _color);
+        bikeAccentRef.current.setColorAt(visBike, b.isMagenta ? _colMagentaBike : _colCyanBike);
         visBike += 1;
       }
       rt.drawnInstances += visBike;
@@ -1564,9 +1509,10 @@ function PalmGroveScenery({ runtimeRef }: { runtimeRef: React.MutableRefObject<W
     if (trunkRef.current && crownRef.current) {
       const planes = rt.frustumPlanes;
       const useFrustum = rt.frustumReady;
+      const sceneryStride = rt.sceneryScale < 0.75 ? 2 : 1;
       let visPalms = 0;
 
-      for (let i = 0; i < palmCount; i++) {
+      for (let i = 0; i < palmCount; i += sceneryStride) {
         const p = palmSeeds[i];
         const raw = (p.slotZ - dist) % span;
         const wrapped = raw < 0 ? raw + span : raw;
@@ -1607,8 +1553,7 @@ function PalmGroveScenery({ runtimeRef }: { runtimeRef: React.MutableRefObject<W
         _dummy.scale.set(1.08, 1.08, 1.08);
         _dummy.updateMatrix();
         crownRef.current.setMatrixAt(visPalms, _dummy.matrix);
-        _color.set(p.isCyan ? '#00d8e8' : '#e63a9c');
-        crownRef.current.setColorAt(visPalms, _color);
+        crownRef.current.setColorAt(visPalms, p.isCyan ? _colCyanPalm : _colPinkPalm);
         visPalms += 1;
       }
 
@@ -1913,7 +1858,7 @@ function CloudHorizonScenery({
       latOffset: ROAD_HALF_WIDTH + 1.9 + (i % 3) * 0.95,
       scale: 1.2 + (i % 3) * 0.16,
       yaw: i * 1.37,
-      colorHex: bushPalette[i % bushPalette.length],
+      color: new THREE.Color(bushPalette[i % bushPalette.length]),
     }));
   }, [bushCount]);
 
@@ -1926,10 +1871,10 @@ function CloudHorizonScenery({
       w: number;
       h: number;
       flipX: number;
-      tint: string;
+      tintColor: THREE.Color;
     }> = [];
     const perSide = CLOUD_HORIZON_SPRITE_COUNT / 2;
-    const tints = ['#ffffff', '#ffe4d8', '#ffd6ee', '#f6c8ff'];
+    const tints = ['#ffffff', '#ffe4d8', '#ffd6ee', '#f6c8ff'].map((hex) => new THREE.Color(hex));
 
     for (let sideIdx = 0; sideIdx < 2; sideIdx++) {
       const side = sideIdx === 0 ? -1 : 1;
@@ -1948,7 +1893,7 @@ function CloudHorizonScenery({
           w,
           h,
           flipX: (j + sideIdx) % 2 === 0 ? 1 : -1,
-          tint: tints[(j + sideIdx) % tints.length],
+          tintColor: tints[(j + sideIdx) % tints.length],
         });
       }
     }
@@ -1976,8 +1921,7 @@ function CloudHorizonScenery({
         _dummy.scale.set(c.w * c.flipX, c.h, 1);
         _dummy.updateMatrix();
         cloudInstRef.current.setMatrixAt(i, _dummy.matrix);
-        _color.set(c.tint);
-        cloudInstRef.current.setColorAt(i, _color);
+        cloudInstRef.current.setColorAt(i, c.tintColor);
       }
       cloudInstRef.current.instanceMatrix.needsUpdate = true;
       if (cloudInstRef.current.instanceColor) {
@@ -1989,15 +1933,13 @@ function CloudHorizonScenery({
   useEffect(() => {
     if (rainRef.current) {
       for (let i = 0; i < rainCount; i++) {
-        _color.set(rainSeeds[i].isCyan ? '#5cf0ff' : '#e68aff');
-        rainRef.current.setColorAt(i, _color);
+        rainRef.current.setColorAt(i, rainSeeds[i].isCyan ? _colCyanRain : _colPinkRain);
       }
       if (rainRef.current.instanceColor) rainRef.current.instanceColor.needsUpdate = true;
     }
     if (bushFoliageRef.current) {
       for (let i = 0; i < bushCount; i++) {
-        _color.set(bushSeeds[i].colorHex);
-        bushFoliageRef.current.setColorAt(i, _color);
+        bushFoliageRef.current.setColorAt(i, bushSeeds[i].color);
       }
       if (bushFoliageRef.current.instanceColor) {
         bushFoliageRef.current.instanceColor.needsUpdate = true;
@@ -2016,6 +1958,7 @@ function CloudHorizonScenery({
 
     const planes = rt.frustumPlanes;
     const useFrustum = rt.frustumReady;
+    const sceneryStride = rt.sceneryScale < 0.75 ? 2 : 1;
 
     // Frustum-cull & compact 2D billboard cloud sprites (skips off-screen ultrawide wings)
     if (cloudInstRef.current) {
@@ -2024,7 +1967,7 @@ function CloudHorizonScenery({
       const liftY = cloudLiftRef.current;
       let visClouds = 0;
 
-      for (let i = 0; i < cloudSprites.length; i++) {
+      for (let i = 0; i < cloudSprites.length; i += sceneryStride) {
         const c = cloudSprites[i];
         const cy = c.y + liftY;
         const boundR = Math.max(c.w, c.h) * 0.62;
@@ -2037,8 +1980,7 @@ function CloudHorizonScenery({
         _dummy.scale.set(c.w * c.flipX, c.h, 1);
         _dummy.updateMatrix();
         cloudInstRef.current.setMatrixAt(visClouds, _dummy.matrix);
-        _color.set(c.tint);
-        cloudInstRef.current.setColorAt(visClouds, _color);
+        cloudInstRef.current.setColorAt(visClouds, c.tintColor);
         visClouds += 1;
       }
 
@@ -2054,7 +1996,7 @@ function CloudHorizonScenery({
     if (rainRef.current) {
       const rainLift = rt.currentGrade * 60;
       let visRain = 0;
-      for (let i = 0; i < rainCount; i++) {
+      for (let i = 0; i < rainCount; i += sceneryStride) {
         const r = rainSeeds[i];
         const y = 132 + rainLift - ((r.yOffset + t * r.speed) % 126);
         if (useFrustum && !isAabbInFrustum(planes, r.x, y, r.z, 0.5, r.len * 0.55, 0.5)) {
@@ -2066,8 +2008,7 @@ function CloudHorizonScenery({
         _dummy.scale.set(0.14, r.len, 0.14);
         _dummy.updateMatrix();
         rainRef.current.setMatrixAt(visRain, _dummy.matrix);
-        _color.set(r.isCyan ? '#5cf0ff' : '#e68aff');
-        rainRef.current.setColorAt(visRain, _color);
+        rainRef.current.setColorAt(visRain, r.isCyan ? _colCyanRain : _colPinkRain);
         visRain += 1;
       }
       rt.drawnInstances += visRain;
@@ -2082,7 +2023,7 @@ function CloudHorizonScenery({
     if (bushFoliageRef.current && bushBaseRef.current) {
       const bushSpan = bushCount * CLOUD_HORIZON_BUSH_SPACING_M;
       let visBushes = 0;
-      for (let i = 0; i < bushCount; i++) {
+      for (let i = 0; i < bushCount; i += sceneryStride) {
         const b = bushSeeds[i];
         const raw = (b.slotZ - dist) % bushSpan;
         const wrapped = raw < 0 ? raw + bushSpan : raw;
@@ -2113,8 +2054,7 @@ function CloudHorizonScenery({
         _dummy.updateMatrix();
         bushFoliageRef.current.setMatrixAt(visBushes, _dummy.matrix);
         bushBaseRef.current.setMatrixAt(visBushes, _dummy.matrix);
-        _color.set(b.colorHex);
-        bushFoliageRef.current.setColorAt(visBushes, _color);
+        bushFoliageRef.current.setColorAt(visBushes, b.color);
         visBushes += 1;
       }
       rt.drawnInstances += visBushes;
@@ -2618,6 +2558,7 @@ function CausewayEmbankmentScenery({
     const planes = rt.frustumPlanes;
     const useFrustum = rt.frustumReady;
     const nearWrapZ = 9;
+    const sceneryStride = rt.sceneryScale < 0.75 ? 2 : 1;
 
     // Frustum-cull & compact wooden tidal breakwater pilings (Lahnungen) + horizontal rails
     if (pilingRef.current && groyneBeamRef.current) {
@@ -2625,7 +2566,7 @@ function CausewayEmbankmentScenery({
       let visPilings = 0;
       let visBeams = 0;
 
-      for (let a = 0; a < groyneArmCount; a++) {
+      for (let a = 0; a < groyneArmCount; a += sceneryStride) {
         const arm = groyneArms[a];
         const raw = (arm.slotZ - dist) % groyneSpan;
         const wrapped = raw < 0 ? raw + groyneSpan : raw;
@@ -2665,7 +2606,7 @@ function CausewayEmbankmentScenery({
         groyneBeamRef.current.setMatrixAt(visBeams, _dummy.matrix);
         visBeams += 1;
 
-        for (let p = 0; p < pilingsPerArm; p++) {
+        for (let p = 0; p < pilingsPerArm; p += sceneryStride) {
           const frac = p / (pilingsPerArm - 1);
           const px = startX + arm.side * (frac * arm.lengthM);
           const pz = z + (p % 2 === 0 ? -0.32 : 0.32);
@@ -2691,7 +2632,7 @@ function CausewayEmbankmentScenery({
       const bollardSpan = (bollardCount / 2) * bollardStepM;
       let visBollards = 0;
 
-      for (let i = 0; i < bollardCount; i++) {
+      for (let i = 0; i < bollardCount; i += sceneryStride) {
         const b = bollardSeeds[i];
         const raw = (b.slotZ - dist) % bollardSpan;
         const wrapped = raw < 0 ? raw + bollardSpan : raw;
@@ -2727,8 +2668,10 @@ function CausewayEmbankmentScenery({
         _dummy.scale.set(0.135, 0.14, 0.135);
         _dummy.updateMatrix();
         bollardCapRef.current.setMatrixAt(visBollards, _dummy.matrix);
-        _color.set(b.isCyan ? '#3cf0ff' : '#ff9852');
-        bollardCapRef.current.setColorAt(visBollards, _color);
+        bollardCapRef.current.setColorAt(
+          visBollards,
+          b.isCyan ? _colCyanBollard : _colAmberBollard
+        );
         visBollards += 1;
       }
 
@@ -2884,9 +2827,7 @@ function CausewayEmbankmentScenery({
 export function SceneryThemes({ runtimeRef, sceneryTheme, quality }: SceneryThemesProps) {
   return (
     <group>
-      <SynthwaveSkyDome theme={sceneryTheme} runtimeRef={runtimeRef} />
-      <Starfield />
-      <SynthwaveSun theme={sceneryTheme} runtimeRef={runtimeRef} />
+      <UnifiedSynthwaveSky theme={sceneryTheme} runtimeRef={runtimeRef} />
       {sceneryTheme === 'neon-city' && <NeonCityScenery runtimeRef={runtimeRef} />}
       {sceneryTheme === 'palm-grove' && <PalmGroveScenery runtimeRef={runtimeRef} />}
       {sceneryTheme === 'cloud-horizon' && (

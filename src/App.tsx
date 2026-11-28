@@ -2,6 +2,7 @@ import { useEffect } from 'react';
 import { SynthwaveAudioBridge } from './audio/SynthwaveAudioBridge';
 import { DevicesModal } from './components/DevicesModal';
 import { MainMenu } from './components/MainMenu';
+import { OfflineIndicator } from './components/PWAInstallButton';
 import { RideScreen } from './components/RideScreen';
 import { RideSummaryModal } from './components/RideSummaryModal';
 import { SavedRidesModal } from './components/SavedRidesModal';
@@ -30,6 +31,8 @@ export default function App() {
       {activeModal === 'settings' && <SettingsModal />}
       {activeModal === 'summary' && <RideSummaryModal />}
       {activeModal === 'rides' && <SavedRidesModal />}
+
+      <OfflineIndicator />
     </div>
   );
 }

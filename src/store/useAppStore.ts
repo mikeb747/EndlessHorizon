@@ -18,8 +18,6 @@ import {
 import {
   ActiveStepSnapshot,
   calculateCaloriesFromKj,
-  calculateLiveTss,
-  RollingPowerBuffer,
 } from '../core/workoutEngine';
 import { COGGAN_ZONES, getEffectiveFtp, PowerZoneInfo, ZoneNumber } from '../core/zones';
 import { ParsedWorkout } from '../core/zwoParser';
@@ -28,6 +26,7 @@ import {
   CadenceSource,
   CadenceStatusSnapshot,
   HeartRateStatusSnapshot,
+  SavedDeviceRecord,
   TrainerStatusSnapshot,
 } from '../devices/types';
 import { WorkoutEngine, WorkoutTickEvent } from '../logic/WorkoutEngine';
@@ -37,20 +36,33 @@ import {
   GpsRoutePresetId,
 } from '../recording/gpsRoutes';
 import type { NormalizedPoint } from '../recording/lineArtTracer';
-import { RideRecorder } from '../recording/rideRecorder';
+import { finalizeRecoveryToSavedRide, RideRecorder } from '../recording/rideRecorder';
 import {
+  appendActiveRideCheckpoint,
+  clearActiveRideCheckpoint,
   deleteSavedRide,
   listSavedRides,
+  loadUnfinishedRide,
   saveCompletedRide,
 } from '../recording/rideStorage';
+import {
+  liveTelemetryBuffer,
+  liveTssTracker,
+  rideHistoryBuffer,
+} from '../recording/telemetryBuffer';
 import {
   formatFitActivityName,
   getSceneryDisplayName,
   SavedRide,
+  UnfinishedRideRecovery,
 } from '../recording/types';
 import { VIRTUAL_START_ALTITUDE_M } from '../recording/virtualGps';
 import { getBrowserCompatibility } from '../utils/browserCheck';
 import { wakeLockController } from '../utils/wakeLock';
+import {
+  detectRecommendedQuality,
+  graphicsGovernor,
+} from '../world/graphicsGovernor';
 import { getZoneGradient } from '../world/roadMath';
 
 export type AppScreen = 'menu' | 'library' | 'ride';
@@ -86,6 +98,9 @@ interface PersistedSettings {
   customGpsRoutePoints: NormalizedPoint[];
   customGpsRouteClosed: boolean;
   quality: QualityLevel;
+  qualityOverride: QualityLevel | null;
+  minimalMode: boolean;
+  showDiagnostics: boolean;
   showHoloCards: boolean;
   showFps: boolean;
   showGraph: boolean;
@@ -101,9 +116,9 @@ interface PersistedSettings {
 }
 
 const STORAGE_KEY = 'neonvelo_settings_v1';
+const initialAutoQuality = detectRecommendedQuality();
 
 function loadPersistedSettings(): PersistedSettings {
-  const { isTouchDevice } = getBrowserCompatibility();
   const defaults: PersistedSettings = {
     ftp: 250,
     sceneryTheme: 'neon-city',
@@ -113,7 +128,10 @@ function loadPersistedSettings(): PersistedSettings {
     customGpsRouteName: '',
     customGpsRoutePoints: [],
     customGpsRouteClosed: false,
-    quality: isTouchDevice ? 'medium' : 'high',
+    quality: initialAutoQuality.quality,
+    qualityOverride: null,
+    minimalMode: false,
+    showDiagnostics: false,
     showHoloCards: true,
     showFps: false,
     showGraph: true,
@@ -185,10 +203,24 @@ function loadPersistedSettings(): PersistedSettings {
         typeof parsed.customGpsRouteClosed === 'boolean'
           ? parsed.customGpsRouteClosed
           : defaults.customGpsRouteClosed,
+      qualityOverride:
+        parsed.qualityOverride === 'low' ||
+        parsed.qualityOverride === 'medium' ||
+        parsed.qualityOverride === 'high'
+          ? parsed.qualityOverride
+          : null,
       quality:
-        parsed.quality === 'low' || parsed.quality === 'medium' || parsed.quality === 'high'
-          ? parsed.quality
+        parsed.qualityOverride === 'low' ||
+        parsed.qualityOverride === 'medium' ||
+        parsed.qualityOverride === 'high'
+          ? parsed.qualityOverride
           : defaults.quality,
+      minimalMode:
+        typeof parsed.minimalMode === 'boolean' ? parsed.minimalMode : defaults.minimalMode,
+      showDiagnostics:
+        typeof parsed.showDiagnostics === 'boolean'
+          ? parsed.showDiagnostics
+          : defaults.showDiagnostics,
       showHoloCards:
         typeof parsed.showHoloCards === 'boolean'
           ? parsed.showHoloCards
@@ -250,6 +282,11 @@ export interface AppState {
   customGpsRoutePoints: NormalizedPoint[];
   customGpsRouteClosed: boolean;
   quality: QualityLevel;
+  qualityOverride: QualityLevel | null;
+  autoDetectedQuality: QualityLevel;
+  autoQualityReason: string;
+  minimalMode: boolean;
+  showDiagnostics: boolean;
   showHoloCards: boolean;
   showFps: boolean;
   showGraph: boolean;
@@ -307,10 +344,13 @@ export interface AppState {
   trainerStatus: TrainerStatusSnapshot;
   hrStatus: HeartRateStatusSnapshot;
   cadenceStatus: CadenceStatusSnapshot;
+  savedDevices: SavedDeviceRecord[];
+  silentReconnectAvailable: boolean;
+  reconnectingLastDevices: boolean;
 
-  // History for graph & summary
-  history: RideHistorySample[];
-  powerSamples1Hz: number[];
+  // Version counter for preallocated typed-array RideHistoryBuffer (avoids O(N) copies)
+  historyVersion: number;
+  lastResumeGapSec: number;
 
   // Live ride recording & persisted completed rides (for FIT export / Strava upload)
   rideStartTimeMs: number | null;
@@ -320,6 +360,7 @@ export interface AppState {
   rideLapCount: number;
   lastCompletedRide: SavedRide | null;
   savedRides: SavedRide[];
+  unfinishedRide: UnfinishedRideRecovery | null;
 
   // Actions
   setScreen: (screen: AppScreen) => void;
@@ -353,6 +394,9 @@ export interface AppState {
   setGpsRouteTargetKm: (km: number) => void;
   setCustomGpsRoute: (name: string, points: NormalizedPoint[], closedLoop: boolean) => void;
   setQuality: (quality: QualityLevel) => void;
+  setQualityAuto: () => void;
+  setMinimalMode: (enabled: boolean) => void;
+  setShowDiagnostics: (show: boolean) => void;
   setShowHoloCards: (show: boolean) => void;
   setShowFps: (show: boolean) => void;
   setShowGraph: (show: boolean) => void;
@@ -377,19 +421,81 @@ export interface AppState {
   disconnectHeartRate: () => Promise<void>;
   connectBleCadence: () => Promise<void>;
   disconnectCadence: () => Promise<void>;
+  reconnectLastDevices: () => Promise<void>;
+  forgetSavedDevice: (deviceId: string) => void;
   refreshSavedRides: () => Promise<void>;
   deleteSavedRideById: (rideId: string) => Promise<void>;
   markRideUploadedToStrava: (rideId: string, stravaActivityId?: number | null) => Promise<void>;
+  resumeUnfinishedRide: () => void;
+  saveUnfinishedRide: () => Promise<void>;
+  discardUnfinishedRide: () => Promise<void>;
   initSession: () => void;
 }
 
 const initialSettings = loadPersistedSettings();
 const initialWorkout = BUILT_IN_WORKOUTS[0];
 
-const rollingPower = new RollingPowerBuffer(3000);
 const rideRecorder = new RideRecorder();
 let deviceManager: DeviceManager | null = null;
+let hudSyncTimer: number | null = null;
 let initialized = false;
+
+export const HUD_SYNC_INTERVAL_MS = 250; // ~4 Hz HUD state flush
+
+export function getRecordingDiagnostics(): {
+  maxSampleGapMs: number;
+  filledSampleCount: number;
+  lastErgWriteLatencyMs: number | null;
+} {
+  return {
+    maxSampleGapMs: rideRecorder.getMaxSampleGapMs(),
+    filledSampleCount: rideRecorder.getFilledSampleCount(),
+    lastErgWriteLatencyMs: deviceManager?.getLastErgWriteLatencyMs() ?? null,
+  };
+}
+
+function flushTelemetryBufferToHud(): void {
+  if (!liveTelemetryBuffer.dirty) return;
+  liveTelemetryBuffer.dirty = false;
+  const s = useAppStore.getState();
+  const nextPower = liveTelemetryBuffer.instantPower;
+  const nextPower3s = liveTelemetryBuffer.power3sAvg;
+  const nextHr = liveTelemetryBuffer.heartRate;
+  const nextCadence = liveTelemetryBuffer.cadence;
+  const nextCadSensor = liveTelemetryBuffer.cadenceSensorRpm;
+  const nextCadTs = liveTelemetryBuffer.cadenceTimestampMs;
+  const nextCadSrc = liveTelemetryBuffer.cadenceSource;
+  const nextSpeed = liveTelemetryBuffer.speedKmh;
+
+  if (
+    s.instantPower === nextPower &&
+    s.power3sAvg === nextPower3s &&
+    s.heartRate === nextHr &&
+    s.cadence === nextCadence &&
+    s.cadenceSensorRpm === nextCadSensor &&
+    s.cadenceTimestampMs === nextCadTs &&
+    s.cadenceSource === nextCadSrc &&
+    s.speedKmh === nextSpeed
+  ) {
+    return;
+  }
+
+  useAppStore.setState({
+    instantPower: nextPower,
+    power3sAvg: nextPower3s,
+    heartRate: nextHr,
+    cadence: nextCadence,
+    cadenceSensorRpm: nextCadSensor,
+    cadenceTimestampMs: nextCadTs,
+    cadenceSource: nextCadSrc,
+    speedKmh: nextSpeed,
+  });
+}
+
+function startHudSyncTimer(): void {
+  if (hudSyncTimer !== null || typeof window === 'undefined') return;
+  hudSyncTimer = window.setInterval(flushTelemetryBufferToHud, HUD_SYNC_INTERVAL_MS);
+}
 
 const workoutEngine = new WorkoutEngine(initialWorkout, {
   ftp: initialSettings.ftp,
@@ -474,51 +580,67 @@ function buildCurrentActivityMeta(state: {
   return { activityName, sceneryName };
 }
 
+function flushActiveRideCheckpoint(force = false): void {
+  if (rideRecorder.getStartTimeMs() === null) return;
+  const s = useAppStore.getState();
+  const payload = rideRecorder.extractCheckpointDelta(
+    {
+      rideMode: s.rideMode,
+      sceneryTheme: s.sceneryTheme,
+      visitedSceneries: s.visitedSceneries,
+      elapsedSec: s.elapsedSec,
+      freeRideZone: s.freeRideZone,
+      freeRideOffsetWatts: s.freeRideOffsetWatts,
+      nowMs: Date.now(),
+    },
+    force
+  );
+  if (!payload) return;
+  void appendActiveRideCheckpoint(payload.meta, payload.chunk);
+}
+
 function finalizeAndPersistCurrentRide(endTimeMs = Date.now()): SavedRide | null {
+  const sessionId = rideRecorder.getSessionId();
   const completed = rideRecorder.finalize(endTimeMs);
   if (!completed) return null;
   const existing = useAppStore.getState().savedRides.filter((r) => r.id !== completed.id);
   useAppStore.setState({
     lastCompletedRide: completed,
     savedRides: [completed, ...existing],
+    unfinishedRide: null,
   });
   void saveCompletedRide(completed);
+  void clearActiveRideCheckpoint(sessionId || undefined);
   return completed;
 }
 
 function ensureDeviceManager(): DeviceManager {
   if (deviceManager) return deviceManager;
+  startHudSyncTimer();
   deviceManager = new DeviceManager({
     onTrainerTelemetry: (data) => {
-      const avg3s = rollingPower.push(data.instantPower, data.timestampMs);
+      // Zero-allocation write directly into module-level ring buffer (no React setState here)
       const state = useAppStore.getState();
       const dedicatedCadenceConnected = state.cadenceStatus.status === 'connected';
       const trainerCadenceSource: CadenceSource = state.trainerStatus.isSimulated
         ? 'simulated'
         : 'ble-trainer';
 
-      const patch: Partial<AppState> = {
-        instantPower: data.instantPower,
-        power3sAvg: avg3s,
-        speedKmh: data.speedKmh,
-      };
+      liveTelemetryBuffer.pushTrainer(
+        data.instantPower,
+        data.cadence,
+        data.speedKmh,
+        data.timestampMs,
+        trainerCadenceSource,
+        dedicatedCadenceConnected
+      );
 
-      // Dedicated BLE Cadence Sensor takes priority over trainer cadence when connected
-      if (!dedicatedCadenceConnected) {
-        patch.cadence = Math.round(data.cadence);
-        patch.cadenceTimestampMs = data.timestampMs;
-        patch.cadenceSource = trainerCadenceSource;
-      }
-
-      useAppStore.setState(patch);
-
-      const effectiveCadence = dedicatedCadenceConnected ? state.cadence : data.cadence;
       // Automatically resume if the rider was auto-paused and starts pedalling again
       if (
         state.autoPauseEnabled &&
         state.runState === 'paused' &&
         state.autoPaused &&
-        (data.instantPower > 0 || effectiveCadence > 0)
+        (data.instantPower > 0 || liveTelemetryBuffer.cadence > 0)
       ) {
         state.resumeWorkout();
       }
@@ -533,29 +655,26 @@ function ensureDeviceManager(): DeviceManager {
               ? 'simulated'
               : 'ble-trainer'
             : 'none';
+      liveTelemetryBuffer.cadenceSource = nextSource;
       useAppStore.setState({ trainerStatus, cadenceSource: nextSource });
     },
     onHeartRateTelemetry: (data) => {
-      useAppStore.setState({ heartRate: data.heartRate });
+      // Zero-allocation direct write into ring buffer (flushed to HUD at ~4 Hz)
+      liveTelemetryBuffer.pushHeartRate(data.heartRate, data.timestampMs);
     },
     onHeartRateStatus: (hrStatus) => {
       useAppStore.setState({ hrStatus });
     },
     onCadenceTelemetry: (data) => {
-      const state = useAppStore.getState();
-      const roundedRpm = Math.round(data.cadenceRpm);
-      useAppStore.setState({
-        cadenceSensorRpm: roundedRpm,
-        cadence: roundedRpm,
-        cadenceTimestampMs: data.timestampMs,
-        cadenceSource: 'ble-cadence',
-      });
+      // Zero-allocation direct write into ring buffer (flushed to HUD at ~4 Hz)
+      liveTelemetryBuffer.pushCadence(data.cadenceRpm, data.timestampMs);
 
+      const state = useAppStore.getState();
       if (
         state.autoPauseEnabled &&
         state.runState === 'paused' &&
         state.autoPaused &&
-        roundedRpm > 0
+        liveTelemetryBuffer.cadence > 0
       ) {
         state.resumeWorkout();
       }
@@ -570,13 +689,31 @@ function ensureDeviceManager(): DeviceManager {
               ? 'simulated'
               : 'ble-trainer'
             : 'none';
+      liveTelemetryBuffer.cadenceSource = nextSource;
+      if (cadenceStatus.status !== 'connected') {
+        liveTelemetryBuffer.clearCadence(state.trainerStatus.status === 'connected');
+      }
       useAppStore.setState({
         cadenceStatus,
         cadenceSource: nextSource,
         ...(cadenceStatus.status !== 'connected' ? { cadenceSensorRpm: 0 } : {}),
       });
     },
+    onSavedDevicesChange: (savedDevices) => {
+      useAppStore.setState({ savedDevices });
+    },
     getFtp: () => useAppStore.getState().ftp,
+    getRecoveryErgState: () => {
+      const s = useAppStore.getState();
+      const targetWatts =
+        s.rideMode === 'freeride'
+          ? s.freeRideTargetWatts
+          : s.activeSnapshot?.targetWatts ?? null;
+      return {
+        isRunning: s.runState === 'running',
+        targetWatts,
+      };
+    },
   });
   return deviceManager;
 }
@@ -587,7 +724,12 @@ function handleEngineStateUpdate(event: WorkoutTickEvent): void {
   if (!event.snapshot) return;
 
   const dtSec = Math.max(0, event.dtSec);
-  const powerNow = state.instantPower;
+  // Sample live telemetry directly from the zero-allocation ring buffer
+  const powerNow = liveTelemetryBuffer.instantPower;
+  const power3sNow = liveTelemetryBuffer.power3sAvg;
+  const hrNow = liveTelemetryBuffer.heartRate;
+  const cadenceNow = liveTelemetryBuffer.cadence;
+  const speedNow = liveTelemetryBuffer.speedKmh;
 
   // Evaluate 5-second zero-pedalling auto-pause while running
   const autoPauseEval = evaluateAutoPause({
@@ -595,7 +737,7 @@ function handleEngineStateUpdate(event: WorkoutTickEvent): void {
     isRunning: state.runState === 'running',
     isAutoPaused: state.autoPaused,
     instantPower: powerNow,
-    cadence: state.cadence,
+    cadence: cadenceNow,
     dtSec,
     zeroPedalSec: state.zeroPedalSec,
   });
@@ -630,45 +772,42 @@ function handleEngineStateUpdate(event: WorkoutTickEvent): void {
 
     if (Math.abs(nextFreeRideTargetWatts - state.freeRideTargetWatts) >= 1) {
       const dm = ensureDeviceManager();
-      void dm.sendErgTarget(nextFreeRideTargetWatts);
+      void dm.sendErgTarget(nextFreeRideTargetWatts, event.nowMs);
     }
   }
 
-  // Record 1 Hz history & work metrics
-  const addedKj = (powerNow * dtSec) / 1000;
-  const totalWorkKj = state.totalWorkKj + addedKj;
-  const calories = calculateCaloriesFromKj(totalWorkKj);
-  const nextPowerSamples =
-    dtSec >= 0.5 ? [...state.powerSamples1Hz, powerNow] : state.powerSamples1Hz;
-  const liveTss = calculateLiveTss(nextPowerSamples, state.ftp);
-
-  const sample: RideHistorySample = {
-    timeSec: Math.round(event.elapsedSec),
-    power: state.power3sAvg || powerNow,
-    heartRate: state.heartRate,
-    targetWatts,
-    cadence: state.cadence,
-  };
-
-  const lastSample = state.history[state.history.length - 1];
-  const nextHistory =
-    lastSample && lastSample.timeSec === sample.timeSec
-      ? [...state.history.slice(0, -1), sample]
-      : [...state.history, sample];
-
-  // Record 1 Hz telemetry stream (HR, Power, Cadence, Speed, Distance, Virtual Altitude & Laps)
-  rideRecorder.recordSample({
+  // Record 1 Hz telemetry on wall-clock seconds, explicitly filling any missed seconds
+  const emittedSamples = rideRecorder.recordOnWallClock({
     timestampMs: event.nowMs,
     dtSec,
     elapsedSec: event.elapsedSec,
     power: powerNow,
-    heartRate: state.heartRate,
-    cadence: state.cadence,
-    speedKmh: state.speedKmh,
+    heartRate: hrNow,
+    cadence: cadenceNow,
+    speedKmh: speedNow,
     gradePct,
     stepIndex: stepIndexForRecord,
     stepLabel: stepLabelForRecord,
   });
+
+  // Push into preallocated typed-array history buffer & O(1) incremental TSS tracker
+  for (let i = 0; i < emittedSamples.length; i++) {
+    const rec = emittedSamples[i];
+    if (rec.filled || dtSec >= 0.5) {
+      liveTssTracker.pushPower(rec.power);
+    }
+    rideHistoryBuffer.push(
+      Math.round(rec.elapsedSec),
+      rec.filled ? rec.power : power3sNow || rec.power,
+      rec.heartRate,
+      targetWatts,
+      rec.cadence
+    );
+  }
+
+  const totalWorkKj = rideRecorder.getTotalWorkKj();
+  const calories = calculateCaloriesFromKj(totalWorkKj);
+  const liveTss = liveTssTracker.getLiveTss(state.ftp);
 
   // Optional mid-ride automatic scenery rotation (Off / 5 min / 10 min / 15 min)
   let nextSceneryTheme = state.sceneryTheme;
@@ -701,8 +840,8 @@ function handleEngineStateUpdate(event: WorkoutTickEvent): void {
     totalWorkKj,
     calories,
     liveTss,
-    powerSamples1Hz: nextPowerSamples,
-    history: nextHistory,
+    historyVersion: rideHistoryBuffer.version,
+    lastResumeGapSec: event.resumeGapSec && event.resumeGapSec > 0 ? event.resumeGapSec : state.lastResumeGapSec,
     zeroPedalSec: autoPauseEval.zeroPedalSec,
     freeRideGrade: nextFreeRideGrade,
     freeRideTargetWatts: nextFreeRideTargetWatts,
@@ -718,6 +857,11 @@ function handleEngineStateUpdate(event: WorkoutTickEvent): void {
       ? state.intervalPulseCount + 1
       : state.intervalPulseCount,
   });
+
+  // Append-only IndexedDB checkpoint every ~7 seconds without blocking the main thread
+  if (rideRecorder.shouldCheckpoint(event.nowMs)) {
+    flushActiveRideCheckpoint(false);
+  }
 }
 
 let finishSummaryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -731,12 +875,12 @@ function clearFinishSummaryTimer(): void {
 
 workoutEngine.setCallbacks({
   onStateUpdate: handleEngineStateUpdate,
-  onErgCommand: ({ targetWatts }) => {
+  onErgCommand: ({ targetWatts, reason, nowMs }) => {
     const dm = ensureDeviceManager();
     const state = useAppStore.getState();
     const resolvedTarget =
       state.rideMode === 'freeride' ? state.freeRideTargetWatts : targetWatts;
-    void dm.sendErgTarget(resolvedTarget);
+    void dm.sendErgTarget(resolvedTarget, reason === 'step-change' ? nowMs : undefined);
   },
   onComplete: ({ elapsedSec, snapshot, nowMs }) => {
     const dm = ensureDeviceManager();
@@ -774,6 +918,9 @@ function persistFromStore(): void {
     customGpsRoutePoints: s.customGpsRoutePoints,
     customGpsRouteClosed: s.customGpsRouteClosed,
     quality: s.quality,
+    qualityOverride: s.qualityOverride,
+    minimalMode: s.minimalMode,
+    showDiagnostics: s.showDiagnostics,
     showHoloCards: s.showHoloCards,
     showFps: s.showFps,
     showGraph: s.showGraph,
@@ -804,6 +951,11 @@ export const useAppStore = create<AppState>((set, get) => ({
   customGpsRoutePoints: initialSettings.customGpsRoutePoints,
   customGpsRouteClosed: initialSettings.customGpsRouteClosed,
   quality: initialSettings.quality,
+  qualityOverride: initialSettings.qualityOverride,
+  autoDetectedQuality: initialAutoQuality.quality,
+  autoQualityReason: initialAutoQuality.reason,
+  minimalMode: initialSettings.minimalMode,
+  showDiagnostics: initialSettings.showDiagnostics,
   showHoloCards: initialSettings.showHoloCards,
   showFps: initialSettings.showFps,
   showGraph: initialSettings.showGraph,
@@ -867,6 +1019,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     deviceName: 'Simulated HRM Strap',
     signalStrength: 0,
     isSimulated: true,
+    errorMessage: null,
   },
   cadenceStatus: {
     status: 'disconnected',
@@ -876,9 +1029,12 @@ export const useAppStore = create<AppState>((set, get) => ({
     isSimulated: false,
     errorMessage: null,
   },
+  savedDevices: [],
+  silentReconnectAvailable: false,
+  reconnectingLastDevices: false,
 
-  history: [],
-  powerSamples1Hz: [],
+  historyVersion: 0,
+  lastResumeGapSec: 0,
 
   rideStartTimeMs: null,
   rideDistanceM: 0,
@@ -887,19 +1043,55 @@ export const useAppStore = create<AppState>((set, get) => ({
   rideLapCount: 0,
   lastCompletedRide: null,
   savedRides: [],
+  unfinishedRide: null,
 
   initSession: () => {
     if (initialized) return;
     initialized = true;
+    graphicsGovernor.setBaseQuality(get().quality);
+    graphicsGovernor.startLongTaskObserver();
     const dm = ensureDeviceManager();
+    set({
+      savedDevices: dm.getSavedDevices(),
+      silentReconnectAvailable: dm.isSilentAutoReconnectAvailable(),
+    });
     const { simulationEnabled } = get();
     if (simulationEnabled) {
       void dm.connectAllSimulated();
     }
+    if (dm.getSavedDevices().length > 0 && dm.isSilentAutoReconnectAvailable()) {
+      void dm.attemptSilentAutoReconnect().then((res) => {
+        if (res.trainer) {
+          set({ simulationEnabled: false });
+          persistFromStore();
+        }
+      });
+    }
     void get().refreshSavedRides();
 
-    // Support ?autostart=1, ?freeride=1, or ?finishPreview=1 to jump directly into the active ride screen
+    // Check IndexedDB for any unfinished ride from a previous crash/reload
+    void loadUnfinishedRide().then((recovery) => {
+      if (
+        recovery &&
+        (recovery.samples.length > 0 || recovery.meta.elapsedSec >= 1) &&
+        rideRecorder.getStartTimeMs() === null
+      ) {
+        set({ unfinishedRide: recovery });
+      }
+    });
+
+    // Flush any pending in-progress ride samples when the tab is backgrounded or unloaded
     if (typeof window !== 'undefined') {
+      const flushIfActive = () => {
+        if (rideRecorder.getStartTimeMs() !== null && get().runState !== 'completed') {
+          flushActiveRideCheckpoint(true);
+        }
+      };
+      window.addEventListener('pagehide', flushIfActive);
+      document.addEventListener('visibilitychange', () => {
+        if (document.hidden) flushIfActive();
+      });
+
       const params = new URLSearchParams(window.location.search);
       if (params.get('freeride') === '1') {
         get().startFreeRide(2, true);
@@ -932,7 +1124,9 @@ export const useAppStore = create<AppState>((set, get) => ({
     const found = state.workouts.find((w) => w.id === workoutId);
     if (!found) return;
     clearFinishSummaryTimer();
-    rollingPower.reset();
+    liveTelemetryBuffer.resetRollingPower();
+    rideHistoryBuffer.reset();
+    liveTssTracker.reset();
     rideRecorder.reset();
     const snap = workoutEngine.loadWorkout(found, {
       ftp: state.ftp,
@@ -956,8 +1150,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       runState: 'idle',
       elapsedSec: 0,
       activeSnapshot: snap,
-      history: [],
-      powerSamples1Hz: [],
+      historyVersion: rideHistoryBuffer.version,
+      lastResumeGapSec: 0,
       totalWorkKj: 0,
       calories: 0,
       liveTss: 0,
@@ -975,7 +1169,9 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   startFreeRide: (initialZone = 2, autoStart = false) => {
     clearFinishSummaryTimer();
-    rollingPower.reset();
+    liveTelemetryBuffer.resetRollingPower();
+    rideHistoryBuffer.reset();
+    liveTssTracker.reset();
     rideRecorder.reset();
     const state = get();
     const terrain = createFreeRideTerrain();
@@ -1008,8 +1204,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       runState: 'idle',
       elapsedSec: 0,
       activeSnapshot: snap,
-      history: [],
-      powerSamples1Hz: [],
+      historyVersion: rideHistoryBuffer.version,
+      lastResumeGapSec: 0,
       totalWorkKj: 0,
       calories: 0,
       liveTss: 0,
@@ -1095,7 +1291,9 @@ export const useAppStore = create<AppState>((set, get) => ({
 
     // Reset if starting fresh after completion
     if (state.runState === 'completed') {
-      rollingPower.reset();
+      liveTelemetryBuffer.resetRollingPower();
+      rideHistoryBuffer.reset();
+      liveTssTracker.reset();
       rideRecorder.reset();
       workoutEngine.reset();
       const freshTerrain =
@@ -1108,8 +1306,8 @@ export const useAppStore = create<AppState>((set, get) => ({
           : state.freeRideTargetWatts;
       set({
         elapsedSec: 0,
-        history: [],
-        powerSamples1Hz: [],
+        historyVersion: rideHistoryBuffer.version,
+        lastResumeGapSec: 0,
         totalWorkKj: 0,
         calories: 0,
         liveTss: 0,
@@ -1165,6 +1363,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({
       runState: 'running',
       musicTestZone: null,
+      unfinishedRide: null,
       autoPaused: false,
       zeroPedalSec: 0,
       visitedSceneries,
@@ -1175,6 +1374,13 @@ export const useAppStore = create<AppState>((set, get) => ({
       rideLapCount: rideRecorder.getLapCount(),
       intervalPulseCount: state.intervalPulseCount + 1,
     });
+
+    if (isNewSession) {
+      // Clear any previous unrelated active checkpoint and persist initial metadata
+      void clearActiveRideCheckpoint().then(() => {
+        flushActiveRideCheckpoint(true);
+      });
+    }
 
     const beginTrainer = async () => {
       if (state.simulationEnabled && dm.getTrainer().getStatus().status !== 'connected') {
@@ -1190,6 +1396,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   pauseWorkout: (isAuto = false) => {
     if (get().runState !== 'running') return;
     workoutEngine.pause();
+    rideRecorder.notifyPaused();
+    flushActiveRideCheckpoint(true);
     const dm = ensureDeviceManager();
     void dm.pauseTrainer();
     void wakeLockController.release();
@@ -1198,6 +1406,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   resumeWorkout: () => {
     if (get().runState !== 'paused') return;
+    rideRecorder.notifyResumed();
     get().startWorkout();
   },
 
@@ -1314,8 +1523,14 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   resetWorkout: () => {
     clearFinishSummaryTimer();
-    rollingPower.reset();
+    const oldSessionId = rideRecorder.getSessionId();
+    liveTelemetryBuffer.resetRollingPower();
+    rideHistoryBuffer.reset();
+    liveTssTracker.reset();
     rideRecorder.reset();
+    if (oldSessionId) {
+      void clearActiveRideCheckpoint(oldSessionId);
+    }
     const dm = ensureDeviceManager();
     void dm.stopTrainer();
     void wakeLockController.release();
@@ -1335,8 +1550,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       zeroPedalSec: 0,
       elapsedSec: 0,
       activeSnapshot: snap,
-      history: [],
-      powerSamples1Hz: [],
+      historyVersion: rideHistoryBuffer.version,
+      lastResumeGapSec: 0,
       totalWorkKj: 0,
       calories: 0,
       liveTss: 0,
@@ -1490,7 +1705,25 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   setQuality: (quality) => {
-    set({ quality });
+    graphicsGovernor.setBaseQuality(quality);
+    set({ quality, qualityOverride: quality });
+    persistFromStore();
+  },
+
+  setQualityAuto: () => {
+    const autoQ = get().autoDetectedQuality;
+    graphicsGovernor.setBaseQuality(autoQ);
+    set({ quality: autoQ, qualityOverride: null });
+    persistFromStore();
+  },
+
+  setMinimalMode: (minimalMode) => {
+    set({ minimalMode });
+    persistFromStore();
+  },
+
+  setShowDiagnostics: (showDiagnostics) => {
+    set({ showDiagnostics });
     persistFromStore();
   },
 
@@ -1581,7 +1814,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
     } else {
       await dm.disconnectAll();
-      rollingPower.reset();
+      liveTelemetryBuffer.clearAll();
       set({
         instantPower: 0,
         power3sAvg: 0,
@@ -1629,8 +1862,8 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   disconnectTrainer: async () => {
     await ensureDeviceManager().getTrainer().disconnect();
-    rollingPower.reset();
     const dedicatedCadenceConnected = get().cadenceStatus.status === 'connected';
+    liveTelemetryBuffer.clearTrainer(dedicatedCadenceConnected);
     set({
       instantPower: 0,
       power3sAvg: 0,
@@ -1649,6 +1882,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   disconnectHeartRate: async () => {
     await ensureDeviceManager().getHeartRateMonitor().disconnect();
+    liveTelemetryBuffer.clearHeartRate();
     set({ heartRate: 0 });
   },
 
@@ -1659,10 +1893,36 @@ export const useAppStore = create<AppState>((set, get) => ({
   disconnectCadence: async () => {
     await ensureDeviceManager().disconnectCadence();
     const trainerConnected = get().trainerStatus.status === 'connected';
+    liveTelemetryBuffer.clearCadence(trainerConnected);
     set({
       cadenceSensorRpm: 0,
       ...(trainerConnected ? {} : { cadence: 0, cadenceTimestampMs: 0 }),
     });
+  },
+
+  reconnectLastDevices: async () => {
+    const dm = ensureDeviceManager();
+    set({ reconnectingLastDevices: true });
+    try {
+      const res = await dm.reconnectLastDevices();
+      if (res.trainer) {
+        set({ simulationEnabled: false });
+        persistFromStore();
+        const s = get();
+        if (s.runState === 'running' && s.activeSnapshot) {
+          await dm.startTrainer();
+          const target =
+            s.rideMode === 'freeride' ? s.freeRideTargetWatts : s.activeSnapshot.targetWatts;
+          await dm.sendErgTarget(target);
+        }
+      }
+    } finally {
+      set({ reconnectingLastDevices: false });
+    }
+  },
+
+  forgetSavedDevice: (deviceId: string) => {
+    ensureDeviceManager().forgetSavedDevice(deviceId);
   },
 
   refreshSavedRides: async () => {
@@ -1698,6 +1958,116 @@ export const useAppStore = create<AppState>((set, get) => ({
       savedRides: cur.savedRides.map((r) => (r.id === rideId ? updated : r)),
       lastCompletedRide: cur.lastCompletedRide?.id === rideId ? updated : cur.lastCompletedRide,
     }));
+  },
+
+  resumeUnfinishedRide: () => {
+    const state = get();
+    const recovery = state.unfinishedRide;
+    if (!recovery) return;
+    clearFinishSummaryTimer();
+    liveTelemetryBuffer.resetRollingPower();
+    rideHistoryBuffer.reset();
+    liveTssTracker.reset();
+
+    const { meta, samples } = recovery;
+    const isFreeRide = meta.rideMode === 'freeride';
+    const matchedWorkout = isFreeRide
+      ? FREE_RIDE_SESSION_WORKOUT
+      : state.workouts.find((w) => w.id === meta.workoutId) ?? state.activeWorkout;
+
+    const activeGpsRoute = compileActiveRouteFromConfig({
+      gpsRoutePreset: state.gpsRoutePreset,
+      gpsRouteTargetKm: state.gpsRouteTargetKm,
+      customGpsRouteName: state.customGpsRouteName,
+      customGpsRoutePoints: state.customGpsRoutePoints,
+      customGpsRouteClosed: state.customGpsRouteClosed,
+      rideMode: meta.rideMode,
+      workoutDurationSec: isFreeRide ? 0 : matchedWorkout.totalDuration,
+    });
+
+    rideRecorder.restoreFromRecovery(recovery, activeGpsRoute);
+
+    workoutEngine.loadWorkout(matchedWorkout, {
+      ftp: meta.ftp,
+      intensityOffsetPct: state.intensityOffsetPct,
+    });
+    const snap = workoutEngine.seek(meta.elapsedSec);
+
+    for (let i = 0; i < samples.length; i++) {
+      const s = samples[i];
+      liveTssTracker.pushPower(s.power);
+      rideHistoryBuffer.push(
+        Math.round(s.elapsedSec),
+        s.power,
+        s.heartRate,
+        snap?.targetWatts ?? s.power,
+        s.cadence
+      );
+    }
+
+    const freeRideZone = (Math.max(1, Math.min(7, Math.round(meta.freeRideZone || 2))) as ZoneNumber);
+    const terrain = isFreeRide ? createFreeRideTerrain() : state.freeRideTerrain;
+    const grade = isFreeRide ? sampleFreeRideGrade(terrain, meta.distanceM) : state.freeRideGrade;
+    const freeRideTargetWatts = isFreeRide
+      ? computeFreeRideTargetWatts(freeRideZone, meta.ftp, meta.freeRideOffsetWatts || 0, grade)
+      : state.freeRideTargetWatts;
+
+    set({
+      screen: 'ride',
+      activeModal: null,
+      unfinishedRide: null,
+      rideMode: meta.rideMode,
+      activeWorkout: isFreeRide ? state.activeWorkout : matchedWorkout,
+      activeGpsRoute,
+      ftp: meta.ftp,
+      sceneryTheme: meta.sceneryTheme,
+      visitedSceneries:
+        meta.visitedSceneries.length > 0 ? meta.visitedSceneries : [meta.sceneryTheme],
+      freeRideZone,
+      freeRideOffsetWatts: meta.freeRideOffsetWatts || 0,
+      freeRideTerrain: terrain,
+      freeRideGrade: grade,
+      freeRideTargetWatts,
+      runState: 'paused',
+      autoPaused: false,
+      zeroPedalSec: 0,
+      elapsedSec: workoutEngine.getElapsedSec(),
+      activeSnapshot: snap,
+      historyVersion: rideHistoryBuffer.version,
+      lastResumeGapSec: 0,
+      totalWorkKj: meta.totalWorkKj,
+      calories: calculateCaloriesFromKj(meta.totalWorkKj),
+      liveTss: liveTssTracker.getLiveTss(meta.ftp),
+      rideStartTimeMs: rideRecorder.getStartTimeMs(),
+      rideDistanceM: rideRecorder.getDistanceM(),
+      rideAltitudeM: rideRecorder.getAltitudeM(),
+      rideAscentM: rideRecorder.getTotalAscentM(),
+      rideLapCount: rideRecorder.getLapCount(),
+    });
+
+    get().startWorkout();
+  },
+
+  saveUnfinishedRide: async () => {
+    const state = get();
+    const recovery = state.unfinishedRide;
+    if (!recovery) return;
+    const saved = finalizeRecoveryToSavedRide(recovery);
+    await saveCompletedRide(saved);
+    await clearActiveRideCheckpoint(recovery.meta.sessionId);
+    const existing = get().savedRides.filter((r) => r.id !== saved.id);
+    set({
+      lastCompletedRide: saved,
+      savedRides: [saved, ...existing],
+      unfinishedRide: null,
+      activeModal: 'summary',
+    });
+  },
+
+  discardUnfinishedRide: async () => {
+    const recovery = get().unfinishedRide;
+    await clearActiveRideCheckpoint(recovery?.meta.sessionId);
+    set({ unfinishedRide: null });
   },
 }));
 

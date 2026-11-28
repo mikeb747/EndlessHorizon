@@ -188,6 +188,7 @@ export class SimulatedHeartRate implements HeartRateDevice {
     deviceName: 'Simulated HRM Strap',
     signalStrength: 0,
     isSimulated: true,
+    errorMessage: null,
   };
 
   private telemetryListeners = new Set<(data: HeartRateTelemetry) => void>();

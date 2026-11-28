@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react';
 import { ChevronDown } from 'lucide-react';
 import { clampFreeRideCenterWatts } from '../core/freeRide';
 import { COGGAN_ZONES, formatClock, getPowerZone, getTargetWatts } from '../core/zones';
+import { rideHistoryBuffer } from '../recording/telemetryBuffer';
 import { useAppStore } from '../store/useAppStore';
 
 export function HistoryGraph() {
@@ -9,7 +10,7 @@ export function HistoryGraph() {
   const containerRef = useRef<HTMLDivElement | null>(null);
 
   const activeWorkout = useAppStore((s) => s.activeWorkout);
-  const history = useAppStore((s) => s.history);
+  const historyVersion = useAppStore((s) => s.historyVersion);
   const elapsedSec = useAppStore((s) => s.elapsedSec);
   const ftp = useAppStore((s) => s.ftp);
   const intensityOffsetPct = useAppStore((s) => s.intensityOffsetPct);
@@ -69,7 +70,7 @@ export function HistoryGraph() {
             ),
             ftp * 1.4
           );
-      const peakHistoryPower = history.reduce((m, h) => Math.max(m, h.power, h.targetWatts), 0);
+      const peakHistoryPower = rideHistoryBuffer.peakPower;
       const maxWatts = Math.ceil(Math.max(peakTarget, peakHistoryPower, 300) / 50) * 50 + 25;
 
       const minHr = 50;
@@ -141,20 +142,22 @@ export function HistoryGraph() {
         ctx.restore();
 
         // Dashed historical ERG target power trace
-        if (history.length > 0) {
+        const histLen = rideHistoryBuffer.length;
+        if (histLen > 0) {
           ctx.save();
           ctx.setLineDash([5, 3]);
           ctx.strokeStyle = '#ffd166';
           ctx.lineWidth = 1.8;
           ctx.beginPath();
           let prevT = -999;
-          history.forEach((pt, i) => {
-            const x = xForSec(pt.timeSec);
-            const y = yForWatts(pt.targetWatts);
-            if (i === 0 || Math.abs(pt.timeSec - prevT) > 5) ctx.moveTo(x, y);
+          for (let i = 0; i < histLen; i++) {
+            const t = rideHistoryBuffer.timeSec[i];
+            const x = xForSec(t);
+            const y = yForWatts(rideHistoryBuffer.targetWatts[i]);
+            if (i === 0 || Math.abs(t - prevT) > 5) ctx.moveTo(x, y);
             else ctx.lineTo(x, y);
-            prevT = pt.timeSec;
-          });
+            prevT = t;
+          }
           ctx.stroke();
           ctx.restore();
         }
@@ -206,7 +209,8 @@ export function HistoryGraph() {
       ctx.restore();
 
       // Actual Power Line (Electric Cyan) — break trace cleanly if user skipped steps
-      if (history.length > 0) {
+      const histLen = rideHistoryBuffer.length;
+      if (histLen > 0) {
         ctx.save();
         ctx.strokeStyle = '#00f0ff';
         ctx.lineWidth = 2.4;
@@ -214,13 +218,14 @@ export function HistoryGraph() {
         ctx.shadowBlur = 8;
         ctx.beginPath();
         let prevTime = -999;
-        history.forEach((pt, i) => {
-          const x = xForSec(pt.timeSec);
-          const y = yForWatts(pt.power);
-          if (i === 0 || Math.abs(pt.timeSec - prevTime) > 5) ctx.moveTo(x, y);
+        for (let i = 0; i < histLen; i++) {
+          const t = rideHistoryBuffer.timeSec[i];
+          const x = xForSec(t);
+          const y = yForWatts(rideHistoryBuffer.power[i]);
+          if (i === 0 || Math.abs(t - prevTime) > 5) ctx.moveTo(x, y);
           else ctx.lineTo(x, y);
-          prevTime = pt.timeSec;
-        });
+          prevTime = t;
+        }
         ctx.stroke();
         ctx.restore();
 
@@ -233,18 +238,20 @@ export function HistoryGraph() {
         ctx.beginPath();
         let startedHr = false;
         let prevHrTime = -999;
-        history.forEach((pt) => {
-          if (pt.heartRate <= 0) return;
-          const x = xForSec(pt.timeSec);
-          const y = yForHr(pt.heartRate);
-          if (!startedHr || Math.abs(pt.timeSec - prevHrTime) > 5) {
+        for (let i = 0; i < histLen; i++) {
+          const hr = rideHistoryBuffer.heartRate[i];
+          if (hr <= 0) continue;
+          const t = rideHistoryBuffer.timeSec[i];
+          const x = xForSec(t);
+          const y = yForHr(hr);
+          if (!startedHr || Math.abs(t - prevHrTime) > 5) {
             ctx.moveTo(x, y);
             startedHr = true;
           } else {
             ctx.lineTo(x, y);
           }
-          prevHrTime = pt.timeSec;
-        });
+          prevHrTime = t;
+        }
         ctx.stroke();
         ctx.restore();
       }
@@ -279,7 +286,7 @@ export function HistoryGraph() {
     const ro = new ResizeObserver(draw);
     ro.observe(container);
     return () => ro.disconnect();
-  }, [activeWorkout, history, elapsedSec, ftp, intensityOffsetPct, rideMode, freeRideZone, freeRideOffsetWatts]);
+  }, [activeWorkout, historyVersion, elapsedSec, ftp, intensityOffsetPct, rideMode, freeRideZone, freeRideOffsetWatts]);
 
   return (
     <section

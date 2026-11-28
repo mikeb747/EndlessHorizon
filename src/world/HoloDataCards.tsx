@@ -5,22 +5,20 @@ import { WorldRuntimeState } from './roadMath';
 
 interface HoloDataCardsProps {
   visible: boolean;
-  cadence: number;
-  speedKmh: number;
-  ftpPct: number;
-  targetWatts: number;
-  zoneHex: string;
   runtimeRef: React.MutableRefObject<WorldRuntimeState>;
 }
+
+type HoloMetricKind = 'cadence' | 'speed' | 'ftpPct' | 'target';
 
 interface SingleCardProps {
   position: [number, number, number];
   rotationY: number;
   label: string;
-  value: string;
   unit: string;
+  metric: HoloMetricKind;
   borderHex: string;
   valueHex: string;
+  useZoneColor?: boolean;
   phaseOffset: number;
   runtimeRef: React.MutableRefObject<WorldRuntimeState>;
 }
@@ -82,42 +80,69 @@ function drawHoloCardCanvas(
   ctx.shadowBlur = 0;
 }
 
+function formatMetricValue(rt: WorldRuntimeState, metric: HoloMetricKind): string {
+  switch (metric) {
+    case 'cadence':
+      return String(Math.round(rt.liveCadence));
+    case 'speed':
+      return rt.liveSpeedKmh.toFixed(1);
+    case 'ftpPct':
+      return `${Math.round(rt.liveFtpPct)}%`;
+    case 'target':
+      return String(Math.round(rt.liveTargetWatts));
+  }
+}
+
 function HoloCardPlane({
   position,
   rotationY,
   label,
-  value,
   unit,
+  metric,
   borderHex,
   valueHex,
+  useZoneColor = false,
   phaseOffset,
   runtimeRef,
 }: SingleCardProps) {
   const meshRef = useRef<THREE.Mesh>(null);
+  const lastDrawKeyRef = useRef<string>('');
+  const syncAccumRef = useRef(0.25);
 
-  const { canvas, texture } = useMemo(() => {
+  const { ctx, texture } = useMemo(() => {
     const c = document.createElement('canvas');
     c.width = 320;
     c.height = 160;
+    const context = c.getContext('2d');
     const t = new THREE.CanvasTexture(c);
     t.colorSpace = THREE.SRGBColorSpace;
-    return { canvas: c, texture: t };
+    return { ctx: context, texture: t };
   }, []);
-
-  useEffect(() => {
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    drawHoloCardCanvas(ctx, label, value, unit, borderHex, valueHex);
-    texture.needsUpdate = true;
-  }, [canvas, texture, label, value, unit, borderHex, valueHex]);
 
   useEffect(() => () => texture.dispose(), [texture]);
 
-  useFrame((state) => {
-    if (!meshRef.current) return;
-    const t = state.clock.elapsedTime;
-    meshRef.current.position.y = position[1] + Math.sin(t * 1.8 + phaseOffset) * 0.045;
-    meshRef.current.rotation.y = rotationY + runtimeRef.current.leanAngle * 0.35;
+  useFrame((state, delta) => {
+    const rt = runtimeRef.current;
+    if (meshRef.current) {
+      const t = state.clock.elapsedTime;
+      meshRef.current.position.y = position[1] + Math.sin(t * 1.8 + phaseOffset) * 0.045;
+      meshRef.current.rotation.y = rotationY + rt.leanAngle * 0.35;
+    }
+
+    // Throttle holographic texture redraws to ~4 Hz and skip if displayed string is unchanged
+    syncAccumRef.current += Math.min(0.1, delta);
+    if (syncAccumRef.current < 0.25 || !ctx) return;
+    syncAccumRef.current = 0;
+
+    const val = formatMetricValue(rt, metric);
+    const activeBorder = useZoneColor ? rt.liveZoneHex : borderHex;
+    const activeValue = useZoneColor ? rt.liveZoneHex : valueHex;
+    const drawKey = `${val}|${activeBorder}`;
+    if (drawKey !== lastDrawKeyRef.current) {
+      lastDrawKeyRef.current = drawKey;
+      drawHoloCardCanvas(ctx, label, val, unit, activeBorder, activeValue);
+      texture.needsUpdate = true;
+    }
   });
 
   return (
@@ -136,17 +161,10 @@ function HoloCardPlane({
 
 /**
  * Translucent neon holographic data cards floating in 3D space flanking the cyclist.
- * Shows CADENCE, SPEED, % FTP, and TARGET with uppercase labels & glowing numbers.
+ * Reads live telemetry directly from runtimeRef inside useFrame so the 3D scene never
+ * re-renders on incoming BLE packets.
  */
-export function HoloDataCards({
-  visible,
-  cadence,
-  speedKmh,
-  ftpPct,
-  targetWatts,
-  zoneHex,
-  runtimeRef,
-}: HoloDataCardsProps) {
+export function HoloDataCards({ visible, runtimeRef }: HoloDataCardsProps) {
   if (!visible) return null;
 
   return (
@@ -155,8 +173,8 @@ export function HoloDataCards({
         position={[-1.78, 1.72, -0.3]}
         rotationY={0.28}
         label="CADENCE"
-        value={String(Math.round(cadence))}
         unit="RPM"
+        metric="cadence"
         borderHex="#00f0ff"
         valueHex="#7cf8ff"
         phaseOffset={0}
@@ -166,8 +184,8 @@ export function HoloDataCards({
         position={[-1.85, 1.02, -0.15]}
         rotationY={0.28}
         label="SPEED"
-        value={speedKmh.toFixed(1)}
         unit="KM/H"
+        metric="speed"
         borderHex="#ff2a9d"
         valueHex="#ff85c8"
         phaseOffset={1.3}
@@ -177,10 +195,11 @@ export function HoloDataCards({
         position={[1.78, 1.72, -0.3]}
         rotationY={-0.28}
         label="% FTP"
-        value={`${Math.round(ftpPct)}%`}
         unit="EFFORT"
-        borderHex={zoneHex}
-        valueHex={zoneHex}
+        metric="ftpPct"
+        borderHex="#00f0ff"
+        valueHex="#00f0ff"
+        useZoneColor
         phaseOffset={2.1}
         runtimeRef={runtimeRef}
       />
@@ -188,8 +207,8 @@ export function HoloDataCards({
         position={[1.85, 1.02, -0.15]}
         rotationY={-0.28}
         label="TARGET"
-        value={String(Math.round(targetWatts))}
         unit="W"
+        metric="target"
         borderHex="#00f0ff"
         valueHex="#ffffff"
         phaseOffset={3.4}

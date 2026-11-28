@@ -29,6 +29,7 @@ import {
 } from '../store/useAppStore';
 import { FtpInput } from './FtpInput';
 import { GpsRoutePreviewSvg } from './GpsRoutePreviewSvg';
+import { PWAInstallButton } from './PWAInstallButton';
 
 const SCENERY_OPTIONS: Array<{ id: SceneryTheme; title: string; subtitle: string }> = [
   {
@@ -100,7 +101,15 @@ export function SettingsModal() {
   const setCustomGpsRoute = useAppStore((s) => s.setCustomGpsRoute);
   const activeGpsRoute = useAppStore((s) => s.activeGpsRoute);
   const quality = useAppStore((s) => s.quality);
+  const qualityOverride = useAppStore((s) => s.qualityOverride);
+  const autoDetectedQuality = useAppStore((s) => s.autoDetectedQuality);
+  const autoQualityReason = useAppStore((s) => s.autoQualityReason);
   const setQuality = useAppStore((s) => s.setQuality);
+  const setQualityAuto = useAppStore((s) => s.setQualityAuto);
+  const minimalMode = useAppStore((s) => s.minimalMode);
+  const setMinimalMode = useAppStore((s) => s.setMinimalMode);
+  const showDiagnostics = useAppStore((s) => s.showDiagnostics);
+  const setShowDiagnostics = useAppStore((s) => s.setShowDiagnostics);
   const showHoloCards = useAppStore((s) => s.showHoloCards);
   const setShowHoloCards = useAppStore((s) => s.setShowHoloCards);
   const showFps = useAppStore((s) => s.showFps);
@@ -613,20 +622,44 @@ export function SettingsModal() {
             </div>
           </section>
 
-          {/* Graphics Quality */}
+          {/* Graphics Quality & Adaptive Governor */}
           <section className="space-y-2.5">
-            <h3 className="font-display text-xs font-bold tracking-[0.16em] text-cyan-300 uppercase flex items-center gap-2">
-              <Monitor className="w-4 h-4" />
-              Graphics Quality
-            </h3>
-            <div className="grid grid-cols-3 gap-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h3 className="font-display text-xs font-bold tracking-[0.16em] text-cyan-300 uppercase flex items-center gap-2">
+                <Monitor className="w-4 h-4" />
+                Graphics Quality
+              </h3>
+              <span className="text-[11px] text-slate-400">
+                {qualityOverride === null
+                  ? `Auto (${autoDetectedQuality.toUpperCase()}) · ${autoQualityReason}`
+                  : `Manual override · Adaptive governor active`}
+              </span>
+            </div>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+              <button
+                type="button"
+                onClick={setQualityAuto}
+                className={`min-h-[68px] p-3 rounded-lg border text-left transition-colors ${
+                  qualityOverride === null
+                    ? 'bg-emerald-500/20 border-emerald-400 text-white'
+                    : 'bg-[#0a0820] border-slate-700/80 text-slate-300 hover:border-cyan-400/50'
+                }`}
+                data-testid="quality-btn-auto"
+              >
+                <div className="font-display text-sm font-bold">
+                  Auto ({autoDetectedQuality[0].toUpperCase() + autoDetectedQuality.slice(1)})
+                </div>
+                <div className="text-[11px] text-slate-300/80 mt-0.5 leading-tight">
+                  Hardware + benchmark detected, degrades automatically if slow
+                </div>
+              </button>
               {QUALITY_OPTIONS.map((opt) => (
                 <button
                   key={opt.id}
                   type="button"
                   onClick={() => setQuality(opt.id)}
                   className={`min-h-[68px] p-3 rounded-lg border text-left transition-colors ${
-                    quality === opt.id
+                    qualityOverride === opt.id
                       ? 'bg-cyan-500/20 border-cyan-400 text-white'
                       : 'bg-[#0a0820] border-slate-700/80 text-slate-300 hover:border-cyan-400/50'
                   }`}
@@ -712,6 +745,29 @@ export function SettingsModal() {
 
             <div className="flex items-center justify-between p-3.5 rounded-lg bg-[#0a0820] border border-cyan-500/25">
               <div>
+                <div className="text-sm font-bold text-white">HUD-Only Minimal Mode (Phones)</div>
+                <div className="text-xs text-slate-400">
+                  Unmounts the 3D WebGL world for maximum battery life while keeping ERG, graph, and FIT recording
+                </div>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={minimalMode}
+                onClick={() => setMinimalMode(!minimalMode)}
+                className={`min-h-[44px] min-w-[78px] px-3 rounded-md font-display text-xs font-bold border ${
+                  minimalMode
+                    ? 'bg-cyan-500/25 border-cyan-400 text-cyan-100'
+                    : 'bg-[#070516] border-slate-600 text-slate-400'
+                }`}
+                data-testid="toggle-minimal-mode"
+              >
+                {minimalMode ? 'ON' : 'OFF'}
+              </button>
+            </div>
+
+            <div className="flex items-center justify-between p-3.5 rounded-lg bg-[#0a0820] border border-cyan-500/25">
+              <div>
                 <div className="text-sm font-bold text-white">Show FPS Counter</div>
                 <div className="text-xs text-slate-400">
                   Displays real-time frame rate inside the 3D viewport corner
@@ -730,6 +786,29 @@ export function SettingsModal() {
                 data-testid="toggle-fps"
               >
                 {showFps ? 'ON' : 'OFF'}
+              </button>
+            </div>
+
+            <div className="flex items-center justify-between p-3.5 rounded-lg bg-[#0a0820] border border-cyan-500/25">
+              <div>
+                <div className="text-sm font-bold text-white">Performance Diagnostics Overlay</div>
+                <div className="text-xs text-slate-400">
+                  Shows frame time, long-task count, max sample gap, and step-to-ERG write latency
+                </div>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={showDiagnostics}
+                onClick={() => setShowDiagnostics(!showDiagnostics)}
+                className={`min-h-[44px] min-w-[78px] px-3 rounded-md font-display text-xs font-bold border ${
+                  showDiagnostics
+                    ? 'bg-cyan-500/25 border-cyan-400 text-cyan-100'
+                    : 'bg-[#070516] border-slate-600 text-slate-400'
+                }`}
+                data-testid="toggle-diagnostics"
+              >
+                {showDiagnostics ? 'ON' : 'OFF'}
               </button>
             </div>
 
@@ -754,6 +833,24 @@ export function SettingsModal() {
                 {showGraph ? 'ON' : 'OFF'}
               </button>
             </div>
+          </section>
+
+          {/* Installable Offline App (PWA) */}
+          <section className="rounded-lg bg-[#09071a] border border-cyan-500/30 p-3.5 space-y-2.5" data-testid="settings-pwa-section">
+            <div className="flex items-center justify-between gap-2">
+              <div className="font-display text-xs font-bold tracking-[0.14em] text-cyan-300 uppercase">
+                Offline App (PWA)
+              </div>
+              <span className="text-[11px] text-slate-400">
+                Cached for offline rides &amp; local FIT export
+              </span>
+            </div>
+            <p className="text-xs text-slate-300 leading-relaxed">
+              Install Endless Horizon Cycling as a standalone app on desktop, Android, or iOS so
+              workouts, Bluetooth ERG control, and local .FIT recording keep working without an
+              internet connection.
+            </p>
+            <PWAInstallButton />
           </section>
 
           {/* Keyboard Shortcuts Reference */}

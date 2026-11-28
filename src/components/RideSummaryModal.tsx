@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 import { formatClock } from '../core/zones';
 import { downloadRideFitFile } from '../recording/rideStorage';
+import { rideHistoryBuffer } from '../recording/telemetryBuffer';
 import { useAppStore } from '../store/useAppStore';
 import { GpsRoutePreviewSvg } from './GpsRoutePreviewSvg';
 
@@ -32,7 +33,6 @@ export function RideSummaryModal() {
   const liveTss = useAppStore((s) => s.liveTss);
   const calories = useAppStore((s) => s.calories);
   const totalWorkKj = useAppStore((s) => s.totalWorkKj);
-  const history = useAppStore((s) => s.history);
   const lastCompletedRide = useAppStore((s) => s.lastCompletedRide);
   const resetWorkout = useAppStore((s) => s.resetWorkout);
   const setScreen = useAppStore((s) => s.setScreen);
@@ -44,17 +44,9 @@ export function RideSummaryModal() {
   const distanceKm = ((lastCompletedRide?.totalDistanceM ?? 0) / 1000).toFixed(2);
   const avgSpeedKmh = (lastCompletedRide?.avgSpeedKmh ?? 0).toFixed(1);
   const ascentM = lastCompletedRide?.totalAscentM ?? 0;
-  const avgPower =
-    lastCompletedRide?.avgPower ??
-    (history.length > 0
-      ? Math.round(history.reduce((sum, h) => sum + h.power, 0) / history.length)
-      : 0);
+  const avgPower = lastCompletedRide?.avgPower ?? rideHistoryBuffer.getAvgPower();
   const maxPower = lastCompletedRide?.maxPower ?? 0;
-  const avgHr =
-    lastCompletedRide?.avgHeartRate ??
-    (history.length > 0
-      ? Math.round(history.reduce((sum, h) => sum + h.heartRate, 0) / history.length)
-      : 0);
+  const avgHr = lastCompletedRide?.avgHeartRate ?? rideHistoryBuffer.getAvgHeartRate();
   const maxHr = lastCompletedRide?.maxHeartRate ?? 0;
   const avgCadence = lastCompletedRide?.avgCadence ?? 0;
   const tss = lastCompletedRide?.tss ?? liveTss;

@@ -8,6 +8,7 @@ export interface SavedDeviceRecord {
   id: string;
   name: string;
   lastConnectedAt: number;
+  role?: 'trainer' | 'hr' | 'cadence';
 }
 
 export interface TrainerTelemetry {
@@ -45,6 +46,7 @@ export interface HeartRateStatusSnapshot {
   deviceName: string | null;
   signalStrength: number; // 0..100
   isSimulated: boolean;
+  errorMessage: string | null;
 }
 
 export interface CadenceStatusSnapshot {
